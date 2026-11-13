@@ -1,22 +1,26 @@
-#!/usr/bin/env python3
-"""Run kubectl with a kubeconfig read from Vault, without that kubeconfig ever
-existing as a file.
+# SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+# SPDX-License-Identifier: Apache-2.0
+"""The ``kubectl_vault`` command: run kubectl with a kubeconfig read from Vault.
 
-    kubectl-vault --secret user_applications_and_services_team/cems_web \\
-                  --field k8s-cems-test -- get pods -n efas-production
+Installed as a console script by ``pip install ecmwf-vault`` (``pyproject.toml`` maps
+``kubectl_vault`` to :func:`main`); this module is private, and the command is the public
+artefact. Run it from a checkout with ``python -m ecmwf_vault.commands.kubectl_vault``.
+
+    kubectl_vault --secret user_applications_and_services_team/cems_web \
+                  --field k8s-cems-test -n glofas-stage get pods
 
 The kubeconfig is fetched over HTTPS, sealed into an anonymous memory file, and handed
-to kubectl as an *inherited descriptor* via ``--kubeconfig=/proc/self/fd/<n>``. The
-wrapper creates no named file and kubectl inherits no Vault token. kubectl itself is a
-trusted consumer, though, and it ends up holding the credential; read the limits below
-before treating this as confidential end to end.
+to kubectl as an *inherited descriptor* via ``--kubeconfig=/proc/self/fd/<n>``. No named
+file is created and kubectl inherits no Vault token. kubectl itself is a trusted consumer,
+though, and it ends up holding the credential; read the limits below before treating this
+as confidential end to end.
 
-Exit status is kubectl's own, so this is usable in scripts and pipelines; a failure of
-the wrapper itself — bad arguments, or a secret that could not be read — is ``2``. kubectl
-can return ``2`` as well, so the way to tell them apart is that the wrapper's failures are
-the ones printed to stderr with a ``kubectl-vault:`` prefix. Anything after ``--`` goes to
-kubectl verbatim; without ``--``, any argument this wrapper does not recognise is passed
-through.
+Exit status is kubectl's own, so this is usable in scripts and pipelines; a failure of the
+command itself — bad arguments, or a secret that could not be read — is ``2``. kubectl can
+return ``2`` as well, so the way to tell them apart is that these failures are the ones
+printed to stderr with a ``kubectl_vault:`` prefix. Anything after ``--`` goes to kubectl
+verbatim; without ``--``, any argument this command does not recognise is passed through, so
+``kubectl_vault --secret X --field Y -n glofas-stage get pods`` works.
 
 Known limits, so they are not surprises:
 
@@ -29,6 +33,8 @@ Known limits, so they are not surprises:
   the credential, and authentication plugins or a caller-supplied ``--kubectl`` can do
   whatever they like with it. Isolate the whole invocation (a container with a read-only
   root filesystem, or a separate account) if that is not acceptable.
+* Unlike the ``vaultenv`` command, the value is never placed in kubectl's environment or
+  argument list — but it is revealed in this process, because a sealed file takes bytes.
 * ``kubectl config set-*`` cannot work — the descriptor is sealed read-only.
 * kubectl leaks its own discovery cache to ``~/.kube/cache`` unless ``--no-kubectl-cache``
   is given (the cache holds API discovery documents, not credentials).
@@ -37,20 +43,18 @@ Known limits, so they are not surprises:
 from __future__ import annotations
 
 import argparse
-import os
-import subprocess
 import sys
 
 from ecmwf_vault import SecretMemoryFile, VaultError, value
 
-EXIT_WRAPPER_FAILED = 2
-EXIT_KUBECTL_NOT_FOUND = 127
-TOKEN_VARIABLE = "ECMWF_VAULT_TOKEN"
+from . import _command_contract as contract
+
+MESSAGE_PREFIX = "kubectl_vault:"
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="kubectl-vault",
+        prog="kubectl_vault",
         description="Run kubectl with a kubeconfig read from Vault.",
         # Without this, a kubectl flag that happens to prefix one of ours (say
         # --field-selector) would be swallowed as an abbreviation of --field.
@@ -69,49 +73,42 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def split_at_separator(argv):
-    """Split our arguments from kubectl's at the first ``--``, if there is one."""
-    if "--" in argv:
-        cut = argv.index("--")
-        return argv[:cut], argv[cut + 1:]
-    return argv, None
-
-
 def resolve_field(fields, requested):
     """Return the field name to use, or explain which ones are there."""
     if requested is not None:
         if requested not in fields:
             raise SystemExit(
                 "no field %r in that secret; it has: %s"
-                % (requested, ", ".join(sorted(fields)) or "none"))
+                % (requested, contract.field_names_text(fields)))
         return requested
     if len(fields) == 1:
         return next(iter(fields))
     raise SystemExit(
         "that secret has %d fields, so --field is required; it has: %s"
-        % (len(fields), ", ".join(sorted(fields)) or "none"))
+        % (len(fields), contract.field_names_text(fields)))
 
 
-def kubeconfig_bytes(fields, field):
+def reveal_kubeconfig(fields, field):
     """The revealed kubeconfig text, as bytes, ready to be sealed."""
     revealed = fields[field].reveal()
-    if isinstance(revealed, str):
+    if not isinstance(revealed, str):
+        # Vault fields can hold JSON, not only strings, so this is reachable rather
+        # than defensive: a mapping here is a misuse, not a kubeconfig.
+        raise SystemExit("the field %r is %s, not kubeconfig text"
+                         % (field, type(revealed).__name__))
+    try:
         return revealed.encode("utf-8")
-    # Vault fields can hold JSON, not only strings, so this is reachable rather
-    # than defensive: a mapping here is a misuse, not a kubeconfig.
-    raise SystemExit("the field %r is %s, not kubeconfig text"
-                     % (field, type(revealed).__name__))
-
-
-def child_environment():
-    """Our environment without the Vault token: kubectl does not need it."""
-    environment = dict(os.environ)
-    environment.pop(TOKEN_VARIABLE, None)
-    return environment
+    except UnicodeEncodeError:
+        # Vault JSON can carry a lone surrogate (\udXXX), which no UTF-8 encoding
+        # accepts. The exception's *object* is the text, so it is never printed —
+        # only the field, which is not the secret. Without this, the failure would be
+        # a traceback carrying the kubeconfig.
+        raise SystemExit("the field %r cannot be encoded as UTF-8, so it cannot be "
+                         "kubeconfig text" % field)
 
 
 def run(argv) -> int:
-    ours, kubectl_arguments = split_at_separator(argv)
+    ours, kubectl_arguments = contract.split_at_separator(argv)
     parser = build_parser()
     if kubectl_arguments is None:
         options, kubectl_arguments = parser.parse_known_args(ours)
@@ -121,36 +118,28 @@ def run(argv) -> int:
     try:
         fields = value(options.secret, mount=options.mount)
     except VaultError as error:
-        print("kubectl-vault: %s" % error, file=sys.stderr)
-        return EXIT_WRAPPER_FAILED
+        contract.report_own_error(MESSAGE_PREFIX, str(error))
+        return contract.EXIT_COMMAND_FAILED
 
     field = resolve_field(fields, options.field)
-    memory = SecretMemoryFile(kubeconfig_bytes(fields, field))
+    memory = SecretMemoryFile(reveal_kubeconfig(fields, field))
     try:
         command = [options.kubectl, "--kubeconfig=/proc/self/fd/%d" % memory.fd]
         if options.no_kubectl_cache:
             command.append("--cache-dir=/dev/null")
         command.extend(kubectl_arguments)
-        try:
-            return subprocess.call(command, pass_fds=(memory.fd,),
-                                   env=child_environment())
-        except FileNotFoundError:
-            print("kubectl-vault: cannot run %r" % options.kubectl, file=sys.stderr)
-            return EXIT_KUBECTL_NOT_FOUND
+        environment = contract.environment_without_token()
+        return contract.run_child(command, environment, message_prefix=MESSAGE_PREFIX,
+                                   descriptor=memory.fd)
     finally:
         memory.close()
 
 
 def main() -> int:
-    try:
-        return run(sys.argv[1:])
-    except SystemExit as error:
-        # resolve_field explains itself on stdout, where argparse sends usage errors.
-        if isinstance(error.code, str):
-            print("kubectl-vault: %s" % error.code, file=sys.stderr)
-            return EXIT_WRAPPER_FAILED
-        return int(error.code)
+    # resolve_field and reveal_kubeconfig explain themselves; argparse's usage errors
+    # arrive here as a number, and are passed through.
+    return contract.run_as_command(run, message_prefix=MESSAGE_PREFIX)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - coverage's defaults do not exclude this
     sys.exit(main())

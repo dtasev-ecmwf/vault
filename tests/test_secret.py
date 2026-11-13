@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+# SPDX-License-Identifier: Apache-2.0
 """The opaque wrapper: the accident this package refuses to be part of.
 
 ``value()`` returns a :class:`Secret`, never a ``str``, so every string-shaped

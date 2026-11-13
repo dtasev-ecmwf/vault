@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+# SPDX-License-Identifier: Apache-2.0
 """Host policy: refuse to hold secrets in memory on a swapping host, and harden
 the process once so a crash cannot dump them.
 

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+# SPDX-License-Identifier: Apache-2.0
 """The opaque wrapper that every value read from the Vault is returned in.
 
 A caller handed a plain ``str`` can put a secret on disk by accident —

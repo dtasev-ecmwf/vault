@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+# SPDX-License-Identifier: Apache-2.0
 """The headline promise: a read never creates a file, and nothing leaks.
 
 Writes are forbidden outright; reads (``/proc/swaps``, the CA bundle) are

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+# SPDX-License-Identifier: Apache-2.0
 """One HTTPS GET to the Vault KV v2 read endpoint, and a strict JSON parse.
 
 ``http.client`` is used instead of ``urllib.request`` on purpose: it has no

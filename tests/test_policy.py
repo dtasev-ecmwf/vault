@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+# SPDX-License-Identifier: Apache-2.0
 """Host policy: swap refusal, the relaxed modes, and one-time hardening."""
 from __future__ import annotations
 

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+# SPDX-License-Identifier: Apache-2.0
 """The Vault client: configuration, the process-wide default instance, caching
 and the ``value()`` entry point.
 """

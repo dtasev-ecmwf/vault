@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+# SPDX-License-Identifier: Apache-2.0
 """Where the Vault token comes from: the environment, then a private config file.
 
 Precedence is ``ECMWF_VAULT_TOKEN`` first, then ``~/.ecmwf-vault/config``. That

@@ -1,3 +1,5 @@
+<!-- SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF) -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # ecmwf-vault
 
 Read one secret from the ECMWF Vault (`https://secrets.ecmwf.int`, a
@@ -216,7 +218,10 @@ Construct a `Vault` for a new lifetime.
   [`Secret`](#the-value-you-get-back-is-a-secret-not-a-str), not a `str`: file writes,
   `json.dumps`, environment assignment and child process arguments raise, while anything
   that merely renders the value — logging, f-strings, `print` — shows `<Secret>`. Either
-  way the plaintext needs an explicit `reveal()`.
+  way the plaintext needs an explicit `reveal()`. That guard is about the library API; the
+  `vaultenv` command shipped with the package does put values into a child's environment,
+  on purpose and by name — see [below](#running-a-command-with-vault-environment-variables),
+  including why that is a weaker boundary than `kubectl_vault`'s.
 - **`cache=False` really means fetch now.** It re-reads Vault even when a value for
   that path is already cached, which is how you observe rotation or a revoked token.
 
@@ -253,29 +258,37 @@ unreadable in a compromised process". Specifically:
   tmpfs.
 - Importing a Python module may write `__pycache__` bytecode unless
   `PYTHONDONTWRITEBYTECODE` is set. No secret is ever in bytecode.
+- The `vaultenv` command puts the fields it reads into a child's **environment**, because
+  that is what an environment variable is. So any process running as the same user can read
+  `/proc/<child-pid>/environ`, the child's own children inherit it, and a child that crashes
+  can carry it into a core collected by a piped `core_pattern`. It is a convenience with a
+  deliberately weaker boundary than `kubectl_vault`'s descriptor handover — see
+  [Running a command with Vault environment variables](#running-a-command-with-vault-environment-variables).
 
 See [DESIGN.md](DESIGN.md) for the full threat model and the reasoning, including
 what is copied from the AgMon MCP executor's credential handling.
 
 ## Running kubectl with a Vault kubeconfig
 
-`examples/kubectl_vault.py` fetches a kubeconfig from Vault and runs kubectl with it,
+The `kubectl_vault` command fetches a kubeconfig from Vault and runs kubectl with it,
 without that kubeconfig ever existing as a file:
 
 ```bash
-PYTHONPATH=/perm/madt/dev/ecmwf-vault/src \
-python /perm/madt/dev/ecmwf-vault/examples/kubectl_vault.py \
-    --secret user_applications_and_services_team/cems_web \
-    --field k8s-cems-test \
-    -- get pods -n efas-production
+kubectl_vault --secret user_applications_and_services_team/cems_web \
+              --field k8s-cems-test -n glofas-stage get pods
 ```
+
+It is installed on `PATH` by `pip install ecmwf-vault` (`pyproject.toml` maps the
+`kubectl_vault` script to `ecmwf_vault.commands.kubectl_vault:main`; that module is private, so the
+command is the artefact and not an API). From an uninstalled checkout, run
+`python -m ecmwf_vault.commands.kubectl_vault` with `PYTHONPATH=src` instead.
 
 It seals the kubeconfig into an anonymous memory file and points kubectl at the
 inherited descriptor with `--kubeconfig=/proc/self/fd/<n>`. **No named file is created**:
 there is no path in any filesystem to find, and the kubeconfig is gone once the last
 descriptor to it closes. kubectl does not inherit `ECMWF_VAULT_TOKEN`.
 
-That is a statement about the kubeconfig the wrapper fetches, not about kubectl. kubectl
+That is a statement about the kubeconfig the command fetches, not about kubectl. kubectl
 is a trusted consumer here, and it is what ends up holding the credential: it *does* reopen
 the descriptor — that is how it reads it — `exec` resets the non-dumpable protection this
 package sets for its own process, a same-user process can read the descriptor through
@@ -283,7 +296,7 @@ package sets for its own process, a same-user process can read the descriptor th
 print the credential (`kubectl config view --raw`), and it writes its own discovery cache
 to `~/.kube/cache` unless you pass `--no-kubectl-cache`. If any of that matters, isolate
 the whole invocation — a container with a read-only root filesystem, or a separate
-account — rather than relying on this wrapper.
+account — rather than relying on this command.
 
 | | |
 | --- | --- |
@@ -294,18 +307,108 @@ account — rather than relying on this wrapper.
 | `--no-kubectl-cache` | add `--cache-dir=/dev/null` (see below) |
 
 Argument handling: everything after `--` goes to kubectl verbatim. Without `--`, any
-argument the wrapper does not recognise is passed through too, so
-`kubectl_vault.py --secret X get pods --field-selector status.phase=Running` works.
+argument the command does not recognise is passed through too, in order — so the example
+above needs no separator, and
+`kubectl_vault --secret X get pods --field-selector status.phase=Running` works.
 
 Worth knowing:
 
 - The descriptor is sealed against *writing*, not *reading*: sealing means the bytes cannot
   change, not that nobody else can look.
+- Unlike `vaultenv`, the kubeconfig never enters kubectl's environment or argument list —
+  but it *is* revealed in the `kubectl_vault` process, because a sealed file takes bytes.
 - `kubectl config set-*` cannot work, because the descriptor is sealed read-only.
 - `kubectl exec -it` and other interactive subcommands work: stdio is inherited.
-- Exit status `2` means the wrapper failed (arguments, or the secret). kubectl's status is
+- Exit status `2` means the command failed (arguments, or the secret). kubectl's status is
   otherwise passed through unchanged — and kubectl can return `2` itself, so the
-  discriminator is stderr: the wrapper's failures carry a `kubectl-vault:` prefix.
+  discriminator is stderr: the command's failures carry a `kubectl_vault:` prefix.
+
+## Running a command with Vault environment variables
+
+The `vaultenv` command reads a secret and runs a command with its fields as environment
+variables, for that command only:
+
+```bash
+vaultenv --secret user_applications_and_services_team/cems_web/db -- psql
+```
+
+It is installed on `PATH` by `pip install ecmwf-vault` (`pyproject.toml` maps the
+`vaultenv` script to `ecmwf_vault.commands.vaultenv:main`; that module is private, so the command
+is the artefact and not an API). From an uninstalled checkout, run
+`python -m ecmwf_vault.commands.vaultenv` with `PYTHONPATH=src` instead.
+
+With no selection, every field of the secret becomes a variable of the same name. Usually you
+want one field rather than all of them — and that is not only tidiness: the default mapping
+has to name *every* field, so a secret holding a field called `k8s-cems-test` refuses the
+whole run. Select what you need:
+
+```bash
+--field MY_TEST_ENV                     # just this field, under its own name
+--set KUBECONFIG=k8s-cems-test          # just this field, renamed
+```
+
+Both options are repeatable and both select, so using them together is the union.
+
+`ECMWF_VAULT_TOKEN` is removed from the command's environment, and no file is created.
+
+| | |
+| --- | --- |
+| `--secret PATH` | Vault path whose fields become variables (required) |
+| `--mount NAME` | Vault mount, if not the default `groups` |
+| `--field NAME` | use only this field, under its own name; repeatable |
+| `--set NAME=FIELD` | use only these fields, renaming them; repeatable |
+| `--force` | overwrite variables the command already inherits |
+
+**This wrapper is weaker than the kubectl one, and the difference is not cosmetic.** An
+environment variable *is* plaintext in the command's memory, so there is no sealed
+descriptor to hand over:
+
+- any process running as the same user can read `/proc/<command-pid>/environ` for as long
+  as the command lives, cooperating or not;
+- the command's own children inherit the variables, and so does every program it execs —
+  an environment cannot be scoped to a single `execve`;
+- `exec` resets `PR_SET_DUMPABLE`, and this host pipes core dumps to a collector, where the
+  kernel ignores `RLIMIT_CORE`, so a command that crashes can put these values into a
+  collected core;
+- anything that logs its environment will log these values.
+
+So use it for values that are already environment-shaped and for short-lived commands, and
+use `kubectl_vault` when the value can travel as a descriptor instead.
+
+Two refusals, both deliberate:
+
+- a field name that would overwrite a variable the command already inherits is an error
+  unless you pass `--force`;
+- a fixed list of well-known names is refused with no override, as is `ECMWF_VAULT_TOKEN`.
+  Four different risks are covered, because a secret should decide none of them:
+  what the command **runs** (`PATH`, `GIT_SSH_COMMAND`, the pagers and editors), which code
+  it **loads** (`LD_PRELOAD`, `PYTHONPATH`, the Java/Node/Ruby/Lua startup hooks), what it
+  **trusts** (the trust-store variables), and where it **writes key material**
+  (`SSLKEYLOGFILE` — not code at all, and here because a secret that names that file undoes
+  this package's whole promise).
+
+That list is finite and **cannot** be complete: the command is your choice, and any program
+may invent an environment variable that names a command — `GIT_SSH_COMMAND` was found by
+review doing exactly that. The real boundary is not the list. In the default mapping the
+secret's *field names* become variable names, so **whoever can write the secret chooses the
+names**; `--field` and `--set` are how you take that choice back for yourself.
+
+The name and collision refusals happen before any value is revealed, so they reveal nothing —
+which is not the same as saying no plaintext exists by then, because fetching the secret has
+already decoded it in this process. The value refusals — a field that is not text, holds a
+NUL, or holds a lone surrogate no encoding accepts — can only be found by revealing, so
+earlier fields in the same selection *are* revealed
+before a later one is refused; what holds is that no partial environment is handed over and no
+command is started, and that a field's text is never printed, only its name and type.
+
+Worth knowing:
+
+- Field values must be text. A JSON number or boolean is refused rather than stringified,
+  because `str(True)` is `"True"` and a command expecting `"true"` would silently get the
+  wrong thing; store the value as a string in Vault.
+- A value containing a NUL byte is refused: no environment variable can carry one.
+- Exit status is the command's own; `2` means the wrapper failed, and the wrapper's
+  failures are the ones carrying the `vaultenv:` stderr prefix.
 
 ## Tests
 

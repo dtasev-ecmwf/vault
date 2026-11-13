@@ -1,16 +1,21 @@
+# SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+# SPDX-License-Identifier: Apache-2.0
 [build-system]
-requires = ["setuptools>=68"]
+# license = "Apache-2.0" and license-files are PEP 639, which needs setuptools>=77.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ecmwf-vault"
-version = "0.2.0"
 description = "Read one ECMWF Vault secret and keep it off disk"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+version = "0.2.0"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = []
 classifiers = [
-    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -19,6 +24,13 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
     "Operating System :: POSIX :: Linux",
 ]
+urls.Homepage = "https://github.com/ecmwf/ecmwf-vault"
+urls.Issues = "https://github.com/ecmwf/ecmwf-vault/issues"
+urls.Repository = "https://github.com/ecmwf/ecmwf-vault"
+# The installed commands. The library itself is imported, not run; the modules behind the
+# scripts are private to ecmwf_vault.commands, so the commands are the artefacts and not APIs.
+scripts.kubectl_vault = "ecmwf_vault.commands.kubectl_vault:main"
+scripts.vaultenv = "ecmwf_vault.commands.vaultenv:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+# SPDX-License-Identifier: Apache-2.0
 """Exception types raised by :mod:`ecmwf_vault`.
 
 Every error is a :class:`RuntimeError`, so a caller that only wants the

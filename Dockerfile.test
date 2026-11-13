@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+# SPDX-License-Identifier: Apache-2.0
 # The offline test gate. pytest and coverage.py are only needed here; the suite
 # itself is stdlib unittest and runs anywhere with no installs.
 FROM python:3.14-slim-trixie AS tests
@@ -9,8 +11,6 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src ./src
 COPY tests ./tests
-# The wrapper's tests run it as a subprocess, so the example has to be present too.
-COPY examples ./examples
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/app/src COVERAGE_FILE=/tmp/.coverage
 CMD ["sh", "-c", \
      "python -m coverage run --source=ecmwf_vault --branch -m pytest -q -p no:cacheprovider tests && python -m coverage report --fail-under=99"]

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+# SPDX-License-Identifier: Apache-2.0
 """Offline test helpers: a loopback HTTPS server and a throwaway TLS identity.
 
 Nothing here ships. The certificate is generated at test setup with the

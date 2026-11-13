@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+# SPDX-License-Identifier: Apache-2.0
 """The HTTPS request, its status mapping, and the strict JSON parse."""
 from __future__ import annotations
 

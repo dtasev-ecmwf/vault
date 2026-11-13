@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
+# SPDX-License-Identifier: Apache-2.0
+
+# This workflow will upload a Python Package using Twine when a release is created
+# For more information see: https://help.github.com/en/actions/language-and-framework-guides/using-python-with-github-actions#publishing-to-package-registries
+
+name: Upload Python Package to PyPI
+
+# on:
+#  release:
+#    types: [created]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    uses: ecmwf/reusable-workflows/.github/workflows/cd-pypi.yml@b485d663ccd989a468530802ef6792516e051cb9 # v2.99
+    secrets: inherit
