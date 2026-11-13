@@ -1,0 +1,14 @@
+services:
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: 512m
+    tmpfs:
+      # The container is read-only; the test harness needs a writable /tmp for
+      # its throwaway TLS identity and coverage data.
+      - /tmp:size=64m,mode=1777
