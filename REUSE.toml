@@ -6,13 +6,11 @@ SPDX-PackageName = "ecmwf-vault"
 SPDX-PackageSupplier = "European Centre for Medium-Range Weather Forecasts (ECMWF)"
 SPDX-PackageDownloadLocation = "https://github.com/ecmwf/ecmwf-vault"
 
-# Files that cannot carry a comment header: the empty PEP 561 marker, the licence
-# files themselves, and the extension-less Vault API note, which GitHub serves as
-# plain text and where an HTML comment would be visible rather than hidden.
+# Files that cannot carry a comment header: the empty PEP 561 marker and the licence
+# files themselves.
 [[annotations]]
 path = [
   "src/ecmwf_vault/py.typed",
-  "README",
   "LICENSE",
   "LICENSES/Apache-2.0.txt",
   "NOTICE",

@@ -40,10 +40,13 @@ and isolate the invocation (a container with a read-only root filesystem, or a s
 account).
 
 Two refusals, both deliberate. A field whose name would overwrite a variable the child
-already has is an error unless you pass ``--force``. A name **on a fixed list of known
-hooks** through which the environment dictates *code the child runs* — ``LD_PRELOAD``,
-``PYTHONPATH``, ``PATH``, ``GIT_SSH_COMMAND`` and the names beside them — is refused
-outright, with no override, and the Vault token itself is refused with it.
+already has is an error unless you pass ``--force``. A name **on a fixed list of known hooks**
+is refused outright, with no override, and the Vault token itself is refused with it. The list
+covers four risks rather than one, because a secret should decide none of them: what the child
+**runs** (``PATH``, ``GIT_SSH_COMMAND``, the pagers and editors), which code it **loads**
+(``LD_PRELOAD``, ``PYTHONPATH``, the Java/Node/Ruby/Lua startup paths), what it **trusts**
+(the trust-store variables), and where it **writes key material** (``SSLKEYLOGFILE`` — not code
+at all, and here because a secret that names that file undoes this package's central promise).
 
 That list is a set of known hooks, not a classification of all of them: no client can
 enumerate every variable that some program will interpret as an instruction, because the

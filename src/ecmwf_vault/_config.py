@@ -14,7 +14,10 @@ the class of surprise this package exists to avoid.
 
 The config file is read as data and never executed, and its permissions are
 enforced the way OpenSSH enforces key permissions: a file another user could
-read or write is refused rather than used.
+read or write is refused rather than used. The directory holding it is held to the
+same rule, because a directory another user can reach lets them list, replace or
+add to what sits in it — the file's own mode protects its contents, the directory's
+protects its existence and its integrity.
 """
 from __future__ import annotations
 
@@ -73,6 +76,11 @@ OWNER_MESSAGE = "the Vault config file is not owned by the current user"
 MODE_MESSAGE = (
     "the Vault config file is readable or writable by another user "
     "(make it mode 600)")
+DIRECTORY_OWNER_MESSAGE = (
+    "the directory holding the Vault config file is not owned by the current user")
+DIRECTORY_MESSAGE = (
+    "the directory holding the Vault config file is readable or writable by another "
+    "user (make it mode 700)")
 SYNTAX_MESSAGE = "the Vault config file has a malformed entry"
 UNSUPPORTED_MESSAGE = "the Vault config file has an unsupported entry"
 DUPLICATE_MESSAGE = "the Vault config file sets the same entry twice"
@@ -152,27 +160,59 @@ def read_config(path: str, policy: str) -> Optional[Dict[str, str]]:
         if info.st_size > MAX_CONFIG_BYTES:
             raise VaultConfigFileError(TOO_LARGE_MESSAGE)
         check_permissions(info, policy)
+        check_directory_permissions(path, policy)
         raw = read_all(descriptor)
     finally:
         os.close(descriptor)
     return parse(decode(raw))
 
 
-def check_permissions(info: os.stat_result, policy: str) -> None:
-    """Refuse (or warn once about) a file another user could read or write."""
-    problem = None
-    if info.st_uid != os.geteuid():
-        problem = OWNER_MESSAGE
-    elif stat.S_IMODE(info.st_mode) & 0o077:
-        problem = MODE_MESSAGE
+def apply_policy(problem: Optional[str], policy: str, key: str) -> None:
+    """Raise, or warn once, about a permission problem that was found."""
     if problem is None:
         return
     if policy == POLICY_REFUSE:
         raise VaultConfigFileError(problem)
     # Both relaxed policies warn, exactly as the swap policy does: there is
     # deliberately no silent way to run with a token another user can read.
-    warn_once("config-permissions", "ecmwf-vault: %s (continuing because %s=%s)"
+    warn_once(key, "ecmwf-vault: %s (continuing because %s=%s)"
               % (problem, POLICY_ENV, policy))
+
+
+def problem_with(info: os.stat_result, owner_message: str,
+                 mode_message: str) -> Optional[str]:
+    """The permission problem a stat result has, or None."""
+    if info.st_uid != os.geteuid():
+        return owner_message
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        return mode_message
+    return None
+
+
+def check_permissions(info: os.stat_result, policy: str) -> None:
+    """Refuse (or warn once about) a file another user could read or write."""
+    apply_policy(problem_with(info, OWNER_MESSAGE, MODE_MESSAGE),
+                 policy, "config-permissions")
+
+
+def check_directory_permissions(path: str, policy: str) -> None:
+    """Refuse (or warn once about) a config directory another user could reach.
+
+    The same rule as the file, because the directory is what lets another user list
+    the file, replace it, or add something beside it. A symlinked directory is
+    resolved first: what matters is the mode of wherever the file actually lives,
+    which is also where an attacker would have to reach.
+    """
+    directory = os.path.dirname(os.path.realpath(path))
+    try:
+        info = os.stat(directory)
+    except OSError:
+        # The directory went away between opening the file and looking at it. The
+        # file was opened, so this is a race rather than a misconfiguration, and
+        # the open itself already succeeded or failed on its own merits.
+        return
+    apply_policy(problem_with(info, DIRECTORY_OWNER_MESSAGE, DIRECTORY_MESSAGE),
+                 policy, "config-directory-permissions")
 
 
 def read_all(descriptor: int) -> bytes:

@@ -5,8 +5,9 @@
 Each command is otherwise its own program: different arguments, a different secret, and
 something different done with it. What they share is only the shape of being a command —
 where this command's arguments stop and the child's begin, what the child's environment must
-never contain, how a child that will not start is reported, and how a refusal becomes an
-exit status instead of a traceback.
+never contain, how a child that will not start is reported, how a refusal becomes an exit
+status instead of a traceback — and how a diagnostic lists field names, which both commands
+need and must phrase the same way.
 
 This is not a layer between the commands and the library: :mod:`ecmwf_vault` imports nothing
 from here, and anything only one command needs stays in that command's module.

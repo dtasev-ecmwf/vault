@@ -8,6 +8,7 @@ absence of silent fall-through, and every refusal the file can provoke.
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import tempfile
 import unittest
@@ -319,6 +320,100 @@ class ConfigFileSafetyTests(ConfigTestCase):
                 path = self.write("%s=%s\n" % (_config.TOKEN_KEY, FILE_TOKEN),
                                   mode=mode)
                 self.assertEqual(self.token_in(path), FILE_TOKEN)
+
+    # -- and the directory holding it, to the same rule ---------------------
+
+    def directory(self, mode):
+        """A config directory with an explicit mode, and the file in it."""
+        directory = tempfile.mkdtemp(prefix="ecmwf-vault-dir-mode-")
+        self.addCleanup(shutil.rmtree, directory, True)
+        # Registered after the rmtree, so it runs first: a directory without write
+        # permission cannot have its contents removed.
+        self.addCleanup(os.chmod, directory, 0o700)
+        path = os.path.join(directory, "config")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("%s=%s\n" % (_config.TOKEN_KEY, FILE_TOKEN))
+        os.chmod(path, 0o600)
+        # Last, so that a mode without owner-write still has the file to hold.
+        os.chmod(directory, mode)
+        return directory, path
+
+    def test_a_private_directory_is_read(self):
+        for mode in (0o700, 0o500, 0o300):
+            with self.subTest(mode=oct(mode)):
+                _, path = self.directory(mode)
+                self.assertEqual(self.token_in(path), FILE_TOKEN)
+
+    def test_a_directory_reachable_by_another_user_is_refused(self):
+        # The file is 0600, so only the directory is wrong: another user could list
+        # it, replace the file, or add one beside it.
+        for mode in (0o755, 0o770, 0o750, 0o705):
+            with self.subTest(mode=oct(mode)):
+                _, path = self.directory(mode)
+                with self.assertRaises(VaultConfigFileError) as caught:
+                    self.token_in(path)
+                self.assertIn("directory", str(caught.exception))
+                self.assertIn("700", str(caught.exception))
+                self.assertNotIn(FILE_TOKEN, str(caught.exception))
+
+    def test_a_reachable_directory_is_accepted_by_either_relaxed_policy(self):
+        _, path = self.directory(0o755)
+        for policy in ("warn", "allow"):
+            with self.subTest(policy=policy):
+                _policy._warned.clear()      # warn_once is once per process
+                with mock.patch("sys.stderr") as stderr:
+                    self.assertEqual(self.token_in(path, policy=policy), FILE_TOKEN)
+                written = "".join(str(call) for call in stderr.write.call_args_list)
+                self.assertIn("directory", written)
+                self.assertIn("700", written)
+                self.assertIn(policy, written)
+
+    def test_a_directory_owned_by_another_user_is_refused(self):
+        # Checked directly: mocking geteuid would trip the file's ownership check
+        # first, so the directory's own branch is exercised on its own here.
+        directory, path = self.directory(0o700)
+        with mock.patch.object(os, "geteuid", return_value=os.geteuid() + 1):
+            with self.assertRaises(VaultConfigFileError) as caught:
+                _config.check_directory_permissions(path, _config.POLICY_REFUSE)
+        self.assertIn("directory", str(caught.exception))
+        self.assertIn("owned", str(caught.exception))
+        self.assertNotIn(directory, str(caught.exception))
+
+    def test_a_directory_owned_by_another_user_can_be_allowed_explicitly(self):
+        _, path = self.directory(0o700)
+        _policy._warned.clear()
+        with mock.patch.object(os, "geteuid", return_value=os.geteuid() + 1):
+            with mock.patch("sys.stderr") as stderr:
+                _config.check_directory_permissions(path, _config.POLICY_ALLOW)
+        written = "".join(str(call) for call in stderr.write.call_args_list)
+        self.assertIn("owned", written)
+
+    def test_a_directory_that_disappears_is_not_itself_an_error(self):
+        # A race between opening the file and looking at its directory. The file
+        # was openable, so the read is judged on the file's own merits.
+        _, path = self.directory(0o700)
+        with mock.patch.object(os, "stat", side_effect=FileNotFoundError):
+            self.assertEqual(self.token_in(path), FILE_TOKEN)
+
+    def test_a_symlinked_directory_is_judged_where_the_file_really_is(self):
+        # A permissive-looking path to a directory that is in fact private: the
+        # mode that matters is the real one, and it is where an attacker would
+        # have to reach.
+        private, _ = self.directory(0o700)
+        exposed, _ = self.directory(0o700)
+        link = os.path.join(exposed, "link")
+        os.symlink(private, link)
+        os.chmod(exposed, 0o755)
+        self.assertEqual(self.token_in(os.path.join(link, "config")), FILE_TOKEN)
+
+    def test_a_private_path_to_an_exposed_directory_is_still_refused(self):
+        exposed, _ = self.directory(0o755)
+        private, _ = self.directory(0o700)
+        link = os.path.join(private, "link")
+        os.symlink(exposed, link)
+        with self.assertRaises(VaultConfigFileError) as caught:
+            self.token_in(os.path.join(link, "config"))
+        self.assertIn("directory", str(caught.exception))
 
     def test_a_file_that_cannot_be_read_is_a_fixed_error(self):
         path = self.write("%s=%s\n" % (_config.TOKEN_KEY, FILE_TOKEN))

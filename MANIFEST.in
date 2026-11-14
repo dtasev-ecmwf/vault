@@ -8,12 +8,6 @@
 # is the reason this file exists: it is not named `test_*`, so setuptools' automatic
 # inclusion left it out and the suite could not run from the archive at all.
 recursive-include tests *.py
-# The extension-less Vault HTTP API note. setuptools' automatic list carried it before this
-# file existed, so it is named here to keep the archive what it was.
-include README
-# README.md links to the design document, so shipping one without the other leaves a broken
-# link in the published archive.
-include DESIGN.md
 # The licence files that ship alongside the published ones: LICENSE and NOTICE are declared
 # in pyproject.toml, these are the rest of what REUSE reads.
 include REUSE.toml

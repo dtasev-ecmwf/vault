@@ -160,7 +160,11 @@ Because a config file is only private if its permissions are, the file is checke
 the way OpenSSH checks a key: a symlink, a non-regular file or an oversized file
 is refused outright, and a file owned by another user or readable/writable by
 group or other is refused by default, with `ECMWF_VAULT_CONFIG_POLICY=warn` or
-`allow` as a deliberate opt-out. Errors name the line, never the content.
+`allow` as a deliberate opt-out. **The directory holding it is held to the same
+rule** (`~/.ecmwf-vault` must be mode 700): a directory another user can reach
+lets them list the file, replace it, or add one beside it. A symlinked directory
+is resolved first, so what is judged is the mode of wherever the file really
+lives. Errors name a line number and the mode that is required, never the content.
 
 Provision it without ever putting the token in your shell history:
 
@@ -265,8 +269,8 @@ unreadable in a compromised process". Specifically:
   deliberately weaker boundary than `kubectl_vault`'s descriptor handover — see
   [Running a command with Vault environment variables](#running-a-command-with-vault-environment-variables).
 
-See [DESIGN.md](DESIGN.md) for the full threat model and the reasoning, including
-what is copied from the AgMon MCP executor's credential handling.
+The two lists in this section are the whole threat model: what this package guarantees, and
+what it does not.
 
 ## Running kubectl with a Vault kubeconfig
 
