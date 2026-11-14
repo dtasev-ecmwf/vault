@@ -69,7 +69,7 @@ def forbid_writes():
 
 class NoDiskTests(unittest.TestCase):
     def setUp(self):
-        environment = _fakes.vault_environment(ECMWF_VAULT_TOKEN=TOKEN)
+        environment = _fakes.vault_environment(token=TOKEN)
         environment.__enter__()
         self.addCleanup(environment.__exit__, None, None, None)
         self.fake = _fakes.FakeVault()
@@ -110,17 +110,18 @@ class NoDiskTests(unittest.TestCase):
         self.assertEqual(contents, "")
         self.assertNotIn(SECRET, contents)
 
-    def test_a_token_file_is_only_ever_read(self):
-        # The token file is a credential on disk and this package only ever reads
-        # it; the guarded open fails the test if anything tries to write.
-        path = _fakes.write_config("ECMWF_VAULT_TOKEN=%s\n" % TOKEN)
-        os.environ.pop("ECMWF_VAULT_TOKEN", None)
-        os.environ["ECMWF_VAULT_CONFIG"] = path
+    def test_a_sealed_token_file_is_only_ever_read(self):
+        # The token file is a credential on disk and, once it is sealed, this package only ever
+        # reads it; the guarded open fails the test if anything tries to write. A file *in the
+        # clear* is the one case where a read writes, because it seals it — which is a change
+        # of form, not of the guarantee, and is asserted in test_config.
+        path = _fakes.write_sealed_token_file(TOKEN)
+        os.environ["ECMWF_VAULT_TOKEN_FILE"] = path
         with forbid_writes():
             self.assertEqual(_fakes.revealed(self.vault.value(EXAMPLE, cache=False)),
                              self.fake.fields)
-        with open(path, encoding="utf-8") as handle:
-            self.assertEqual(handle.read(), "ECMWF_VAULT_TOKEN=%s\n" % TOKEN)
+        with open(path, "rb") as handle:
+            self.assertTrue(handle.read())
         self.assertEqual(self.fake.requests[0].headers["X-Vault-Token"], TOKEN)
 
     def test_the_secret_lives_only_in_an_anonymous_memory_file(self):

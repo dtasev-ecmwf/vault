@@ -23,9 +23,12 @@ from ._errors import InvalidSecretPathError, VaultError
 MAX_PATH_BYTES = 512
 MAX_MOUNT = 64
 
+# The cubbyhole mount. Not configurable by a caller, and not a KV v2 mount: it has no ``data/``
+# version layer, and its contents belong to the token that wrote them.
+CUBBYHOLE = "cubbyhole"
+
 _SEGMENT = re.compile(r"[A-Za-z0-9._@+-]+")
 _EMPTY_SEGMENTS = ("", ".", "..")
-
 
 def validate_mount(mount: object) -> str:
     """Return the mount if it is one permitted path segment."""
@@ -50,6 +53,16 @@ def build_target(mount: str, segments: Tuple[str, ...]) -> str:
     """Build the KV v2 read target for a validated mount and path."""
     quoted = [quote(segment, safe="") for segment in segments]
     return "/v1/" + quote(mount, safe="") + "/data/" + "/".join(quoted)
+
+
+def build_cubbyhole_target(segments: Tuple[str, ...]) -> str:
+    """Build the cubbyhole read target: no mount choice, and no ``data/`` layer.
+
+    The path is validated before this is called, so the same rules against traversal and
+    quoting apply as for :func:`build_target`.
+    """
+    quoted = [quote(segment, safe="") for segment in segments]
+    return "/v1/" + CUBBYHOLE + "/" + "/".join(quoted)
 
 
 def split_base_url(base_url: object) -> Tuple[str, int]:

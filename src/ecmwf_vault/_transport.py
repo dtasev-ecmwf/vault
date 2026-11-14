@@ -1,6 +1,10 @@
 # SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
 # SPDX-License-Identifier: Apache-2.0
-"""One HTTPS GET to the Vault KV v2 read endpoint, and a strict JSON parse.
+"""One HTTPS GET to Vault, and a strict JSON parse.
+
+Two reads are supported and they share the request: a KV v2 secret read, and a token
+lookup of the caller's own token (``auth/token/lookup-self``), which answers with a
+flat ``data`` object rather than the nested one a KV v2 read uses.
 
 ``http.client`` is used instead of ``urllib.request`` on purpose: it has no
 proxy support (so ``HTTPS_PROXY`` cannot redirect a token-bearing request) and
@@ -35,6 +39,15 @@ CONSTANT_MESSAGE = "the Vault response contains a non-finite number"
 SIZE_MESSAGE = "the Vault response exceeds the size limit"
 DELETED_MESSAGE = "the secret has no readable version"
 REQUEST_MESSAGE = "the Vault request failed"
+
+# The caller's own token. Not under the data mount: auth endpoints are fixed, whatever
+# ECMWF_VAULT_MOUNT says. A token *can* be denied this — the default policy allows it, and a
+# policy that replaces the default need not — which is why a refusal is reported as a refusal
+# rather than as proof that the token is gone.
+TOKEN_LOOKUP_PATH = "/v1/auth/token/lookup-self"
+TOKEN_REFUSED_MESSAGE = (
+    "the Vault token cannot look itself up (403); that is usually a token which has expired "
+    "or been revoked, and can equally be a policy that does not allow a token to read itself")
 
 
 # OpenSSL's X509_V_FLAG_PARTIAL_CHAIN and X509_V_FLAG_X509_STRICT. Python's ssl
@@ -190,8 +203,60 @@ def _envelope(document: Any) -> Dict[str, Any]:
     return inner
 
 
+def _lookup_data(document: Any) -> Dict[str, Any]:
+    """Return the metadata mapping from a token lookup response.
+
+    Every field is passed through as Vault sent it — this function checks the *shape* and
+    nothing else, so a field this package has never heard of still reaches the caller.
+    """
+    if not isinstance(document, dict):
+        raise VaultResponseError(SHAPE_MESSAGE)
+    data = document.get("data")
+    if not isinstance(data, dict):
+        raise VaultResponseError(SHAPE_MESSAGE)
+    return data
+
+
+def _cubbyhole_fields(document: Any) -> Dict[str, Any]:
+    """Return the field mapping from a cubbyhole read response.
+
+    A cubbyhole read answers with a flat ``data`` object, like a token lookup, but its keys are
+    used as names rather than read as metadata, so they are checked the way a KV v2 mapping's
+    are. A null payload is refused rather than reported as no fields: a path that does not
+    exist answers 404, so reaching here with nothing under ``data`` is a bad response.
+    """
+    if not isinstance(document, dict):
+        raise VaultResponseError(SHAPE_MESSAGE)
+    data = document.get("data")
+    if not isinstance(data, dict):
+        raise VaultResponseError(SHAPE_MESSAGE)
+    for key in data:
+        if not isinstance(key, str) or not key:
+            raise VaultResponseError(SHAPE_MESSAGE)
+    return data
+
+
 def parse_fields(body: bytearray) -> Dict[str, Any]:
     """Parse a KV v2 read body into its field mapping, then wipe the buffer."""
+    return _parse(body, _envelope)
+
+
+def parse_cubbyhole_fields(body: bytearray) -> Dict[str, Any]:
+    """Parse a cubbyhole read body into its field mapping, then wipe the buffer."""
+    return _parse(body, _cubbyhole_fields)
+
+
+def parse_token_info(body: bytearray) -> Dict[str, Any]:
+    """Parse a token lookup body into its metadata mapping, then wipe the buffer.
+
+    A lookup answers with a flat ``data`` object, one level shallower than a KV v2 read,
+    so it needs its own shape check: :func:`_envelope` would reject it as malformed.
+    """
+    return _parse(body, _lookup_data)
+
+
+def _parse(body: bytearray, shape) -> Dict[str, Any]:
+    """Decode a Vault body with the strict hooks, wipe it, and apply ``shape`` to it."""
     try:
         document = json.loads(
             body, object_pairs_hook=_unique_object, parse_constant=_reject_constant)
@@ -199,22 +264,39 @@ def parse_fields(body: bytearray) -> Dict[str, Any]:
         raise VaultResponseError(INVALID_JSON_MESSAGE) from None
     finally:
         wipe(body)
-    return _envelope(document)
+    return shape(document)
 
 
-def _close(connection: Optional[http.client.HTTPSConnection]) -> None:
+def _close_connection(connection: Optional[http.client.HTTPSConnection]) -> None:
     if connection is not None:
         connection.close()
 
 
-def fetch_secret(host: str, port: int, target: str, token: str, timeout: float,
-                 context: ssl.SSLContext) -> Dict[str, Any]:
-    """Perform one Vault read and return the secret's fields.
+def _close_response(response: Optional[http.client.HTTPResponse]) -> None:
+    """Close a response's file, ignoring one that is already closed or already broken.
 
-    Never reads an error body, and never puts the token or a response fragment
-    into a message.
+    An error response is never read, and a response that outlives its connection keeps the
+    socket's descriptor open — for as long as the raised exception, and the traceback that
+    keeps this frame alive, does. That is a descriptor per refused request in any process that
+    logs an exception or otherwise holds on to one. Closing the response in the ``finally``
+    that closes the connection is what releases it *now* rather than at collection time.
+
+    The ``OSError`` is swallowed because this runs while a refusal may already be on its way
+    out, and a socket that is already broken must not take the place of the reason we are
+    leaving.
     """
+    if response is not None:
+        try:
+            response.close()
+        except OSError:
+            pass
+
+
+def _get(target: str, host: str, port: int, token: str, timeout: float,
+         context: ssl.SSLContext) -> bytearray:
+    """One authenticated GET, returning the bounded body for the caller to parse and wipe."""
     connection = None
+    response = None
     try:
         connection = http.client.HTTPSConnection(
             host, port, timeout=timeout, context=context)
@@ -228,5 +310,44 @@ def fetch_secret(host: str, port: int, target: str, token: str, timeout: float,
         raise VaultUnavailableError(
             "%s: %s" % (REQUEST_MESSAGE, type(error).__name__)) from None
     finally:
-        _close(connection)
-    return parse_fields(body)
+        # The response before the connection, and both on every path out of here: a response
+        # left to the collector holds the descriptor until nothing refers to the frame it is in.
+        _close_response(response)
+        _close_connection(connection)
+    return body
+
+
+def fetch_secret(host: str, port: int, target: str, token: str, timeout: float,
+                 context: ssl.SSLContext) -> Dict[str, Any]:
+    """Perform one Vault KV v2 read and return the secret's fields.
+
+    Never reads an error body, and never puts the token or a response fragment
+    into a message.
+    """
+    return parse_fields(_get(target, host, port, token, timeout, context))
+
+
+def fetch_cubbyhole(host: str, port: int, target: str, token: str, timeout: float,
+                    context: ssl.SSLContext) -> Dict[str, Any]:
+    """Perform one cubbyhole read and return its fields.
+
+    Same request as :func:`fetch_secret`; only the response shape differs, and the target is
+    built by the caller because a cubbyhole has no mount to substitute.
+    """
+    return parse_cubbyhole_fields(_get(target, host, port, token, timeout, context))
+
+
+def fetch_token_info(host: str, port: int, token: str, timeout: float,
+                     context: ssl.SSLContext) -> Dict[str, Any]:
+    """Read the token's own metadata from ``auth/token/lookup-self``.
+
+    A refusal is re-raised with the lookup's own wording rather than the generic "cannot
+    read this secret", because a 403 here is about the *token* rather than about a path:
+    whatever the cause, this token cannot read its own details, and the message names the
+    usual causes without pretending they are the whole list.
+    """
+    try:
+        body = _get(TOKEN_LOOKUP_PATH, host, port, token, timeout, context)
+    except VaultPermissionError:
+        raise VaultPermissionError(TOKEN_REFUSED_MESSAGE) from None
+    return parse_token_info(body)

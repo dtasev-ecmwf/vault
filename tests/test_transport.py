@@ -3,6 +3,8 @@
 """The HTTPS request, its status mapping, and the strict JSON parse."""
 from __future__ import annotations
 
+import gc
+import json
 import os
 import ssl
 import tempfile
@@ -22,6 +24,11 @@ from ecmwf_vault._errors import (
 EXAMPLE = "user_applications_and_services_team/cems_web/k8s-cems-test"
 TARGET = "/v1/groups/data/" + EXAMPLE
 TOKEN = "synthetic-vault-token"
+
+
+def _open_descriptors():
+    """How many descriptors this process holds open, for the leak tests."""
+    return len(os.listdir("/proc/self/fd"))
 
 
 class TransportTests(unittest.TestCase):
@@ -151,6 +158,78 @@ class TransportTests(unittest.TestCase):
                         side_effect=OSError(101, "network is unreachable")):
             with self.assertRaises(VaultUnavailableError):
                 self.fetch()
+
+    # -- what a request must not leave behind -----------------------------
+
+    def test_a_refused_request_closes_the_response_and_the_connection(self):
+        # An error response is never read — that is deliberate, so a refusal cannot put a
+        # response fragment in a message — and one left open holds the socket's descriptor for
+        # as long as the exception (and the traceback keeping its frame alive) does.
+        response = mock.Mock(status=403)
+        connection = mock.Mock()
+        connection.getresponse.return_value = response
+        with mock.patch("http.client.HTTPSConnection", return_value=connection):
+            with self.assertRaises(VaultPermissionError):
+                self.fetch()
+        response.close.assert_called_once_with()
+        connection.close.assert_called_once_with()
+
+    def test_a_body_over_the_size_limit_closes_the_response_too(self):
+        response = mock.Mock(status=200)
+        connection = mock.Mock()
+        connection.getresponse.return_value = response
+        with mock.patch.object(_transport, "_read_bounded",
+                               side_effect=VaultResponseError("too large")):
+            with mock.patch("http.client.HTTPSConnection", return_value=connection):
+                with self.assertRaises(VaultResponseError):
+                    self.fetch()
+        response.close.assert_called_once_with()
+
+    def test_a_close_that_fails_does_not_replace_the_reason_we_are_leaving(self):
+        response = mock.Mock(status=403)
+        response.close.side_effect = OSError(9, "bad file descriptor")
+        connection = mock.Mock()
+        connection.getresponse.return_value = response
+        with mock.patch("http.client.HTTPSConnection", return_value=connection):
+            with self.assertRaises(VaultPermissionError):
+                self.fetch()
+
+    def test_a_response_that_was_never_reached_is_not_closed(self):
+        # getresponse() itself failing leaves nothing to close, and closing a None must not be
+        # attempted: this is the path a connection that breaks mid-request takes.
+        connection = mock.Mock()
+        connection.getresponse.side_effect = OSError(104, "connection reset")
+        with mock.patch("http.client.HTTPSConnection", return_value=connection):
+            with self.assertRaises(VaultUnavailableError):
+                self.fetch()
+        connection.close.assert_called_once_with()
+
+    def test_a_refused_request_does_not_hold_a_descriptor_open(self):
+        # The integration form of the test above, and the reason it matters: an exception that
+        # is kept alive — which is what a caller that logs it does — keeps its traceback, and
+        # this frame, and the response object read out of it, so the descriptor went with the
+        # exception rather than with the request.
+        #
+        # assertRaises cannot be used here. unittest clears the exception's traceback on purpose
+        # (to break the reference cycle), so holding caught.exception holds no frame at all and
+        # this test would pass with the response never closed. Verified: 5 exceptions retained
+        # that way carry 0 live tracebacks; retained the way below, 5.
+        self.fake.status = 403
+        self.fake.raw = b'{"errors": ["permission denied"]}'
+        held = []
+        for _ in range(5):
+            try:
+                self.fetch()
+            except VaultPermissionError as error:
+                held.append(error)
+        self.assertTrue(all(error.__traceback__ is not None for error in held),
+                        "the test is holding nothing without a traceback to hold")
+        gc.collect()
+        while_held = _open_descriptors()
+        held.clear()
+        del held
+        gc.collect()
+        self.assertEqual(while_held, _open_descriptors())
 
     def test_sslkeylogfile_is_never_created_or_written(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -296,6 +375,188 @@ class TransportTests(unittest.TestCase):
     def test_parse_fields_refuses_a_non_json_buffer(self):
         with self.assertRaises(VaultResponseError):
             _transport.parse_fields(bytearray(b"{"))
+
+
+class TokenLookupTests(unittest.TestCase):
+    """``auth/token/lookup-self``: the same request, a shallower envelope.
+
+    A lookup answers with a flat ``data`` object, so it has its own parse — the KV v2 one
+    would reject it as malformed. What is checked here is that the request is the one
+    intended, that the metadata passes through untouched, and that a refusal is reported
+    as the lookup's own answer rather than as a permission detail.
+    """
+
+    def setUp(self):
+        self.fake = _fakes.FakeVault()
+        self.addCleanup(self.fake.stop)
+        self.metadata = {"ttl": 7112, "renewable": True, "display_name": "a-token"}
+        self.fake.raw = json.dumps({"data": self.metadata}).encode("utf-8")
+        self.context = _transport.create_context(self.fake.ca_bundle)
+
+    def lookup(self, token=TOKEN):
+        return _transport.fetch_token_info(
+            self.fake.host, self.fake.port, token, 5.0, self.context)
+
+    def test_the_request_is_the_token_lookup_path_and_carries_the_token(self):
+        self.assertEqual(self.lookup(), self.metadata)
+        (request,) = self.fake.requests
+        self.assertEqual(request.method, "GET")
+        self.assertEqual(request.path, "/v1/auth/token/lookup-self")
+        self.assertEqual(request.headers["X-Vault-Token"], TOKEN)
+        self.assertNotIn(TOKEN, request.path)
+
+    def test_the_lookup_path_does_not_follow_the_data_mount(self):
+        # auth endpoints are fixed; ECMWF_VAULT_MOUNT names the KV data mount only.
+        with mock.patch.dict(os.environ, {"ECMWF_VAULT_MOUNT": "somewhere-else"}):
+            self.lookup()
+        self.assertEqual(self.fake.requests[0].path, "/v1/auth/token/lookup-self")
+
+    def test_every_metadata_field_passes_through_untouched(self):
+        # Including one this package has never heard of: the caller gets Vault's answer, not
+        # this package's idea of which fields matter.
+        self.fake.raw = json.dumps({"data": {
+            "ttl": 0, "creation_ttl": 43200, "expire_time": None,
+            "renewable": False, "num_uses": 5, "policies": ["default", "cems-read"],
+            "meta": {"owner": "cems"}, "something_new": [1, {"deep": True}],
+        }}).encode("utf-8")
+        info = self.lookup()
+        self.assertEqual(info["creation_ttl"], 43200)
+        self.assertIsNone(info["expire_time"])
+        self.assertEqual(info["something_new"], [1, {"deep": True}])
+        self.assertEqual(info["meta"], {"owner": "cems"})
+
+    def test_the_strict_json_hooks_apply_here_too(self):
+        for raw in (b"not json", b'{"data":{"a":1,"a":2}}', b'{"data":{"a":NaN}}'):
+            with self.subTest(body=raw):
+                self.fake.raw = raw
+                with self.assertRaises(VaultResponseError):
+                    self.lookup()
+
+    def test_a_wrong_shape_is_refused(self):
+        for raw in (b"[]", b'{"nope":{}}', b'{"data":[]}', b'{"data":null}',
+                    b'{"data":"a-string"}', b"{}"):
+            with self.subTest(body=raw):
+                self.fake.raw = raw
+                with self.assertRaises(VaultResponseError):
+                    self.lookup()
+
+    def test_a_refused_token_is_reported_as_the_lookup_failing(self):
+        # 403 here means the token cannot read itself, which is the answer the caller needs:
+        # the generic "cannot read this secret" wording would send them looking elsewhere.
+        self.fake.status = 403
+        with self.assertRaises(VaultPermissionError) as caught:
+            self.lookup()
+        message = str(caught.exception)
+        self.assertIn("look itself up", message)
+        self.assertNotIn("read this secret", message)
+        # A policy can deny this lookup for a perfectly valid token, so the message names
+        # both causes rather than asserting which one it was.
+        self.assertIn("expired or been revoked", message)
+        self.assertIn("policy", message)
+
+    def test_other_statuses_keep_their_own_meaning(self):
+        for status, expected in ((404, SecretNotFoundError), (429, VaultUnavailableError),
+                                 (500, VaultUnavailableError)):
+            with self.subTest(status=status):
+                self.fake.status = status
+                with self.assertRaises(expected):
+                    self.lookup()
+
+    def test_an_unreachable_vault_is_reported_as_unavailable(self):
+        context = _transport.create_context(self.fake.ca_bundle)
+        with self.assertRaises(VaultUnavailableError):
+            _transport.fetch_token_info("127.0.0.1", 1, TOKEN, 5.0, context)
+
+    def test_parse_token_info_wipes_the_buffer_it_was_given(self):
+        buffer = bytearray(b'{"data":{"ttl":7112}}')
+        self.assertEqual(_transport.parse_token_info(buffer), {"ttl": 7112})
+        self.assertEqual(bytes(buffer), bytes(len(buffer)))
+
+    def test_parse_token_info_refuses_a_non_json_buffer(self):
+        with self.assertRaises(VaultResponseError):
+            _transport.parse_token_info(bytearray(b"{"))
+
+    def test_the_two_parses_are_not_interchangeable(self):
+        # The nesting is the whole difference between the two reads. A lookup body parsed as
+        # a KV v2 read is rejected outright; a KV v2 body parsed as a lookup is *not* — it
+        # is passed through as metadata that happens to have "data" and "metadata" fields,
+        # which is correct for a parse whose contract is "check the shape and hand it over".
+        # Pinned so the asymmetry is a known one and the two cannot drift into each other.
+        flat = bytearray(b'{"data":{"ttl":7112}}')
+        with self.assertRaises(VaultResponseError):
+            _transport.parse_fields(flat)
+        nested = bytearray(b'{"data":{"data":{"x":1},"metadata":{}}}')
+        self.assertEqual(_transport.parse_token_info(nested),
+                         {"data": {"x": 1}, "metadata": {}})
+
+
+class CubbyholeParseTests(unittest.TestCase):
+    """The flat response shape a cubbyhole read answers with, and what is refused."""
+
+    def test_a_flat_body_is_parsed_into_its_fields(self):
+        body = bytearray(b'{"data":{"password":"x","user":"madt"}}')
+        self.assertEqual(_transport.parse_cubbyhole_fields(body),
+                         {"password": "x", "user": "madt"})
+
+    def test_the_buffer_is_wiped_after_parsing(self):
+        body = bytearray(b'{"data":{"password":"hunter2"}}')
+        _transport.parse_cubbyhole_fields(body)
+        self.assertEqual(bytes(body), b"\0" * len(body))
+
+    def test_a_nested_KV_v2_body_is_not_read_as_a_cubbyhole_one(self):
+        # The two shapes differ by one level, and mixing them up would hand the caller a
+        # mapping whose only key is "data". Pinned in both directions.
+        nested = bytearray(b'{"data":{"data":{"x":1},"metadata":{}}}')
+        self.assertEqual(_transport.parse_cubbyhole_fields(nested),
+                         {"data": {"x": 1}, "metadata": {}})
+        with self.assertRaises(VaultResponseError):
+            _transport.parse_fields(bytearray(b'{"data":{"x":1}}'))
+
+    def test_a_body_with_no_object_under_data_is_refused(self):
+        for body in (b'{}', b'{"data":null}', b'{"data":[]}', b'{"data":"x"}', b'[1]',
+                     b'{"data":true}'):
+            with self.subTest(body=body):
+                with self.assertRaises(VaultResponseError):
+                    _transport.parse_cubbyhole_fields(bytearray(body))
+
+    def test_other_top_level_members_are_ignored_as_vaults_to_include(self):
+        body = bytearray(b'{"data":{"a":"1"},"lease_duration":60,"warnings":[]}')
+        self.assertEqual(_transport.parse_cubbyhole_fields(body), {"a": "1"})
+
+    def test_a_field_name_must_be_a_non_empty_string(self):
+        for body in (b'{"data":{"":"x"}}',):
+            with self.subTest(body=body):
+                with self.assertRaises(VaultResponseError):
+                    _transport.parse_cubbyhole_fields(bytearray(body))
+
+    def test_a_non_finite_number_or_duplicate_key_is_refused(self):
+        # The same strict JSON hooks the other parses use, so a cubbyhole body cannot smuggle
+        # a value that is not a JSON number, or shadow one field with a later duplicate.
+        for body in (b'{"data":{"a":NaN}}', b'{"data":{"a":1,"a":2}}'):
+            with self.subTest(body=body):
+                with self.assertRaises(VaultResponseError):
+                    _transport.parse_cubbyhole_fields(bytearray(body))
+
+    def test_the_cubbyhole_fetcher_sends_one_request_to_the_cubbyhole_target(self):
+        fake = _fakes.FakeVault()
+        self.addCleanup(fake.stop)
+        fake.fields = {"password": "hunter2"}
+        context = _transport.create_context(fake.ca_bundle)
+        fields = _transport.fetch_cubbyhole(
+            fake.host, fake.port, "/v1/cubbyhole/madt/efas", "hvs.a-token", 10.0, context)
+        self.assertEqual(fields, {"password": "hunter2"})
+        self.assertEqual([(r.method, r.path) for r in fake.requests],
+                         [("GET", "/v1/cubbyhole/madt/efas")])
+        self.assertEqual(fake.requests[0].headers["X-Vault-Token"], "hvs.a-token")
+
+    def test_a_cubbyhole_404_is_reported_as_no_such_secret(self):
+        fake = _fakes.FakeVault()
+        self.addCleanup(fake.stop)
+        fake.status = 404
+        context = _transport.create_context(fake.ca_bundle)
+        with self.assertRaises(SecretNotFoundError):
+            _transport.fetch_cubbyhole(fake.host, fake.port, "/v1/cubbyhole/nope",
+                                       "hvs.a-token", 10.0, context)
 
 
 if __name__ == "__main__":

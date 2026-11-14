@@ -39,26 +39,25 @@ the ``kubectl_vault`` command and its descriptor handover, keep the child's life
 and isolate the invocation (a container with a read-only root filesystem, or a separate
 account).
 
-Two refusals, both deliberate. A field whose name would overwrite a variable the child
-already has is an error unless you pass ``--force``. A name **on a fixed list of known hooks**
-is refused outright, with no override, and the Vault token itself is refused with it. The list
-covers four risks rather than one, because a secret should decide none of them: what the child
-**runs** (``PATH``, ``GIT_SSH_COMMAND``, the pagers and editors), which code it **loads**
-(``LD_PRELOAD``, ``PYTHONPATH``, the Java/Node/Ruby/Lua startup paths), what it **trusts**
-(the trust-store variables), and where it **writes key material** (``SSLKEYLOGFILE`` — not code
-at all, and here because a secret that names that file undoes this package's central promise).
+Two refusals. A field whose name would overwrite a variable the child already has is an error
+unless ``--force`` is given. A name on a fixed list is refused outright, with no override,
+because a secret must not decide any of the five things that list covers: what the child **runs**
+(``PATH``, ``GIT_SSH_COMMAND``, the pagers and editors), which code it **loads**
+(``LD_PRELOAD``, ``PYTHONPATH``, the Java/Node/Ruby/Lua startup paths), what it **trusts** (the
+trust-anchor variables), where it **writes key material** (``SSLKEYLOGFILE``), and whose
+**credential** it holds (``VAULT_TOKEN``, HashiCorp's vault CLI variable).
 
-That list is a set of known hooks, not a classification of all of them: no client can
-enumerate every variable that some program will interpret as an instruction, because the
-program is the caller's choice. Names beyond it are the caller's judgement — which is one
-reason ``--force`` is deliberate, and the reason the README says a secret's field names have
-to be as trusted as its values.
+The list is a set of known names, not a classification of all of them: no client can enumerate
+every variable some program reads as an instruction. Beyond it the judgement is the caller's,
+which is why ``--force`` is explicit and why a secret's field names must be as trusted as its
+values.
 
-The name refusals run before any value is revealed, so they reveal nothing. That is not a
-claim that no plaintext exists in this process: ``value()`` has already fetched and decoded
-the secret by then. The value refusals — a field that is not text, or holds a NUL — can only
-be discovered by revealing, and they stop before a partial environment is handed over; a
-field's *text* is never printed, only its name and type.
+Name refusals run before any value is revealed, so they reveal nothing. Value refusals — a field
+that is not text, or holds a NUL — can only be found by revealing, and stop before a partial
+environment is handed over. A field's *text* is never printed, only its name and type.
+
+An expired token is replaced and the read retried once, through the workflow in
+:mod:`ecmwf_vault._login`. With no terminal to ask on, that is reported and the command fails.
 
 Exit status is the child's own, so this drops into scripts and pipelines; a failure of the
 command itself — bad arguments, a refused name, a secret that could not be read, or a
@@ -74,7 +73,8 @@ import os
 import re
 import sys
 
-from ecmwf_vault import VaultError, value
+from ecmwf_vault import _environment
+from ecmwf_vault import VaultError, _login, value
 
 from . import _command_contract as contract
 
@@ -83,32 +83,23 @@ MESSAGE_PREFIX = "vaultenv:"
 # variable may not.
 NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
-# Names through which a secret would decide something about the child that a secret should
-# not. Refused outright — --force does not cover these — and there are four distinct risks
-# here, which the refusal message names:
+# Names through which a secret would decide something about the child. Refused outright;
+# --force does not cover them. Five risks, each named in the refusal message:
 #
-#   1. what the child RUNS   — PATH, SHELL, IFS, and the programs a tool runs for you
-#                              (GIT_SSH_COMMAND, GIT_ASKPASS, the pagers and editors);
-#   2. which code it LOADS   — the dynamic linker, GCONV_PATH/LOCPATH, and the startup paths
-#                              of Python, Perl, Ruby, Node, Lua and the JVM;
-#   3. what it TRUSTS        — the trust-anchor variables: SSL_CERT_FILE, SSL_CERT_DIR,
-#                              REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE, GIT_SSL_CAINFO,
-#                              NODE_EXTRA_CA_CERTS, AWS_CA_BUNDLE;
-#   4. where it WRITES       — SSLKEYLOGFILE, which is not code and not trust at all: it
-#                              names the file a TLS library writes session keys to.
+#   1. RUNS       — PATH, SHELL, IFS, and the programs a tool runs for you (GIT_SSH_COMMAND,
+#                   GIT_ASKPASS, the pagers and editors);
+#   2. LOADS      — the dynamic linker, GCONV_PATH/LOCPATH, and the startup paths of Python,
+#                   Perl, Ruby, Node, Lua and the JVM;
+#   3. TRUSTS     — the trust anchors: SSL_CERT_FILE, SSL_CERT_DIR, REQUESTS_CA_BUNDLE,
+#                   CURL_CA_BUNDLE, GIT_SSL_CAINFO, NODE_EXTRA_CA_CERTS, AWS_CA_BUNDLE;
+#   4. WRITES     — SSLKEYLOGFILE, the file a TLS library writes session keys to;
+#   5. CREDENTIAL — VAULT_TOKEN (HashiCorp's vault CLI variable) and the legacy name this
+#                   package's own children are scrubbed of, so a field cannot put it back.
 #
-# (4) is here because this package's whole promise is that a secret does not reach a disk,
-# and a secret that can name that file can undo it. It was review that made the distinction:
-# the first version of this comment, and the message beside it, called every entry a way to
-# "run code the secret chose", which was never true of the trust anchors or SSLKEYLOGFILE.
-#
-# The list is finite and cannot be complete. The program the child runs is the caller's
-# choice, and any program may invent an environment variable that names a command — Git's
-# GIT_SSH_COMMAND was found in review by doing exactly that. So the real boundary is not this
-# list: it is that the *field names* of a secret used with the default mapping become
-# variable names, which means whoever can write the secret chooses them. The list removes the
-# famous hooks; trusting the Vault path is what covers the rest, and the README and §28.1
-# say so.
+# (4) undoes the promise that a secret never reaches a disk. (5) makes the child somebody
+# else's authenticated client. The list cannot be complete: a secret's *field names* become
+# variable names, so whoever can write the secret chooses them. This removes the well-known
+# ones; trusting the Vault path covers the rest.
 FORBIDDEN_NAMES = frozenset({
     # The dynamic linker, and the loaders that read code from a path.
     "LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH", "GCONV_PATH", "LOCPATH",
@@ -129,6 +120,10 @@ FORBIDDEN_NAMES = frozenset({
     # and can make a library write key material somewhere.
     "SSL_CERT_FILE", "SSL_CERT_DIR", "SSLKEYLOGFILE", "REQUESTS_CA_BUNDLE",
     "CURL_CA_BUNDLE", "GIT_SSL_CAINFO", "NODE_EXTRA_CA_CERTS", "AWS_CA_BUNDLE",
+    # Setting either of these hands the child an authentication token for a Vault the secret
+    # was never about. The legacy name is written by reference to the scrub that strips it, so
+    # a field cannot undo what child_environment() just removed.
+    "VAULT_TOKEN", _environment.LEGACY_TOKEN_ENV,
 })
 
 # Families that are enumerated by a counter, so no fixed list of names can cover them:
@@ -171,22 +166,19 @@ def refuse_forbidden_names(wanted) -> None:
     """Refuse the names through which a secret would decide what the child runs or trusts.
 
     Runs before any value is revealed, so this refusal reveals nothing. Note what it does
-    *not* claim: the secret has already been fetched and decoded by the time it runs, the
-    list is finite so it cannot be a complete boundary, and a listed name is not necessarily
-    *code* — the trust-anchor names change what the child believes, and ``SSLKEYLOGFILE``
-    names a file it writes key material to. See the comment on :data:`FORBIDDEN_NAMES`.
+    *not* claim: the secret has already been fetched and decoded by then, the list is finite
+    so it cannot be a complete boundary, and a listed name is not necessarily code — the
+    trust anchors change what the child believes, and ``VAULT_TOKEN`` and the legacy token name
+    name a credential. See the comment on :data:`FORBIDDEN_NAMES`.
     """
     for variable in wanted:
-        if variable == contract.TOKEN_VARIABLE:
-            raise SystemExit(
-                "refusing to put %s in a command's environment: that is the credential "
-                "this package exists to keep out of one" % contract.TOKEN_VARIABLE)
         if variable in FORBIDDEN_NAMES or variable.startswith(FORBIDDEN_PREFIXES):
             raise SystemExit(
                 "refusing to set %s from a Vault field: a command that honours it decides "
-                "which program runs, which code that program loads, what it trusts, or where "
-                "it writes key material — and there is no --force for that. If you really "
-                "need it, set it in your own wrapper rather than from a secret." % variable)
+                "which program runs, which code that program loads, what it trusts, where it "
+                "writes key material, or whose credential it holds — and there is no --force "
+                "for that. If you really need it, set it in your own wrapper rather than from "
+                "a secret." % variable)
 
 
 def require_field(field_name, fields) -> None:
@@ -233,8 +225,13 @@ def variable_mapping(selected, renamed, fields):
 
 
 def build_child_environment(wanted, force):
-    """Our environment without the Vault token, once the overwrites are agreed to."""
-    environment = contract.environment_without_token()
+    """This environment without the legacy token name, once the overwrites are agreed to.
+
+    The scrub happens here and the fields are applied by the caller, so a field named
+    ``ECMWF_VAULT_TOKEN`` would put back what was just removed. :data:`FORBIDDEN_NAMES` holds
+    that name for exactly that reason.
+    """
+    environment = _environment.child_environment()
     clashes = sorted(name for name in wanted if name in environment)
     if clashes and not force:
         raise SystemExit(
@@ -285,7 +282,10 @@ def run(argv) -> int:
         return contract.EXIT_COMMAND_FAILED
 
     try:
-        fields = value(options.secret, mount=options.mount)
+        # A token that has run out is replaced and the read tried once more; anything the
+        # read refuses for another reason is reported unchanged.
+        fields = _login.run_retrying_once_if_token_lookup_refused(
+            lambda: value(options.secret, mount=options.mount), prefix=MESSAGE_PREFIX)
     except VaultError as error:
         contract.report_own_error(MESSAGE_PREFIX, str(error))
         return contract.EXIT_COMMAND_FAILED

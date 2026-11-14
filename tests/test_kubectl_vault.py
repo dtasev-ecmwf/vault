@@ -26,6 +26,7 @@ import unittest
 from unittest import mock
 
 import _fakes
+import _loopback_guard
 from ecmwf_vault import Secret, VaultError
 from ecmwf_vault.commands import _command_contract as contract
 from ecmwf_vault.commands import kubectl_vault as kl
@@ -104,7 +105,9 @@ class InProcessTests(unittest.TestCase):
         self.assertEqual(call.kwargs["pass_fds"], (descriptor,))
 
     def test_kubectl_does_not_inherit_the_vault_token(self):
-        with _fakes.vault_environment(ECMWF_VAULT_TOKEN=TOKEN):
+        # Set by hand, not by the fixture: nothing here reads that name, and the point is that a
+        # stale export from an older copy of this package is not passed on to the child.
+        with mock.patch.dict(os.environ, {"ECMWF_VAULT_TOKEN": "hvs.a-legacy-export"}):
             _, call = self.run_cli(["--secret", "p", "--", "version"])
         self.assertNotIn("ECMWF_VAULT_TOKEN", call.kwargs["env"])
         self.assertIn("HOME", call.kwargs["env"])
@@ -215,6 +218,12 @@ with open(path) as handle:
     print("KUBECONFIG_START")
     print(handle.read(), end="")
     print("KUBECONFIG_END")
+try:
+    with open(path, "ab") as handle:
+        handle.write(b"appended")
+    print("CONFIG_APPEND OK")
+except OSError as error:
+    print("CONFIG_APPEND REFUSED " + type(error).__name__)
 sys.exit(int(os.environ.get("STAND_IN_EXIT", "0")))
 ''' % sys.executable
 
@@ -235,12 +244,15 @@ sys.exit(int(os.environ.get("STAND_IN_EXIT", "0")))
         """A deliberately small environment, so nothing is inherited by accident."""
         environment = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-            "PYTHONPATH": SOURCE,
+            "PYTHONPATH": _loopback_guard.child_python_path(SOURCE),
             "PYTHONDONTWRITEBYTECODE": "1",
             "LANG": "C.UTF-8",
             "HOME": self.home,
             "TMPDIR": self.scratch,
-            "ECMWF_VAULT_TOKEN": TOKEN,
+            "ECMWF_VAULT_TOKEN_FILE": _fakes.token_file(TOKEN),
+            # A stale export of the name an older version of this package authenticated with:
+            # the stand-in reports whether it arrived, so the strip is not taken on trust.
+            "ECMWF_VAULT_TOKEN": "hvs.a-legacy-export",
             "ECMWF_VAULT_ADDR": self.fake.base_url,
             "ECMWF_VAULT_CA_BUNDLE": self.fake.ca_bundle,
         }
@@ -276,8 +288,29 @@ sys.exit(int(os.environ.get("STAND_IN_EXIT", "0")))
         self.assertEqual(contents.split("\nKUBECONFIG_END", 1)[0] + "\n", KUBECONFIG)
 
     def test_kubectl_does_not_inherit_the_vault_token(self):
+        # Reported by the child itself, from its own environment.
         result = self.standard("--", "version")
         self.assertIn("ENV_HAS_TOKEN False", result.stdout)
+        self.assertNotIn("hvs.a-legacy-export", result.stdout)
+
+    def test_the_kubeconfig_cannot_be_written_back(self):
+        # Sealed is the guarantee kubectl is relied on to respect: the descriptor it reads is
+        # not a file it can change. Reported by the child, not asserted by us.
+        result = self.standard("--", "version")
+        self.assertIn("CONFIG_APPEND REFUSED", result.stdout)
+
+    def test_no_named_file_holds_the_kubeconfig(self):
+        # Nothing the command writes: gpg creates ~/.gnupg for its own use on a first run, so
+        # the claim is about the secret, not about the absence of any file at all.
+        result = self.standard("--", "version")
+        self.assertIn("KUBECONFIG_END", result.stdout)
+        for root in (self.scratch, self.home):
+            for directory, _, names in os.walk(root):
+                for name in names:
+                    path = os.path.join(directory, name)
+                    with open(path, "rb") as handle:
+                        contents = handle.read()
+                    self.assertNotIn(b"SYNTHETIC-KUBECTL-TOKEN", contents, path)
 
     def test_nothing_is_left_behind_in_the_working_directory(self):
         result = self.standard("--", "version")
@@ -330,7 +363,7 @@ sys.exit(int(os.environ.get("STAND_IN_EXIT", "0")))
                 self.assertNotIn("kubectl_vault:", result.stderr)
 
     def test_help_works_without_a_token_or_a_secret(self):
-        result = self.run_cli("--help", ECMWF_VAULT_TOKEN="")
+        result = self.run_cli("--help", ECMWF_VAULT_TOKEN_FILE="")
         self.assertEqual(result.returncode, 0)
         self.assertIn("kubectl_vault", result.stdout)
         self.assertIn("--secret", result.stdout)
@@ -383,7 +416,7 @@ sys.exit(int(os.environ.get("STAND_IN_EXIT", "0")))
         self.assertNotIn("ARGV", result.stdout)
 
     def test_a_vault_failure_is_reported_without_running_kubectl(self):
-        result = self.standard("--", "version", ECMWF_VAULT_TOKEN="")
+        result = self.standard("--", "version", ECMWF_VAULT_TOKEN_FILE="")
         self.assertEqual(result.returncode, 2)
         self.assertIn("kubectl_vault:", result.stderr)
         self.assertNotIn("ARGV", result.stdout)
@@ -391,13 +424,9 @@ sys.exit(int(os.environ.get("STAND_IN_EXIT", "0")))
     def test_an_unsupported_interpreter_is_reported_without_running_kubectl(self):
         # Take memfd_create away from the interpreter that runs the command, the way
         # a conda-forge build lacks it, and check the diagnosis reaches the user.
-        directory = tempfile.mkdtemp(prefix="ecmwf-vault-nosupport-")
-        self.addCleanup(shutil.rmtree, directory, True)
-        with open(os.path.join(directory, "sitecustomize.py"), "w",
-                  encoding="utf-8") as handle:
-            handle.write("import os\ndel os.memfd_create\n")
+        directory = _loopback_guard.sitecustomize_dir("import os\ndel os.memfd_create\n")
         result = self.standard("--", "version",
-                               PYTHONPATH="%s:%s" % (directory, SOURCE))
+                               PYTHONPATH=os.pathsep.join((directory, SOURCE)))
         self.assertEqual(result.returncode, 2)
         self.assertIn("os.memfd_create", result.stderr)
         self.assertNotIn("ARGV", result.stdout)

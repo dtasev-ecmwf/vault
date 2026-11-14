@@ -26,6 +26,7 @@ import unittest
 from unittest import mock
 
 import _fakes
+import _loopback_guard
 from ecmwf_vault import Secret, VaultError
 from ecmwf_vault.commands import _command_contract as contract
 from ecmwf_vault.commands import vaultenv as cli
@@ -118,18 +119,21 @@ class InProcessTests(unittest.TestCase):
         for name, text in FIELDS.items():
             self.assertEqual(environment[name], text)
 
-    def test_the_command_does_not_inherit_the_vault_token(self):
-        with _fakes.vault_environment(ECMWF_VAULT_TOKEN=TOKEN):
-            _, _, environment = self.run_cli(
-                ["--secret", "p", "--", "cmd"], mapping(PGUSER="cems"))
-        self.assertNotIn("ECMWF_VAULT_TOKEN", environment)
-
     def test_the_rest_of_the_environment_is_kept(self):
         with _fakes.vault_environment():
             _, _, environment = self.run_cli(
                 ["--secret", "p", "--", "cmd"], mapping(PGUSER="cems"))
         self.assertIn("HOME", environment)
         self.assertIn("PATH", environment)
+
+    def test_the_vault_token_is_not_handed_to_the_command(self):
+        # Set by hand, not by the fixture: nothing here reads that name, and the point is that a
+        # stale export from an older copy of this package does not travel into the child.
+        with mock.patch.dict(os.environ, {"ECMWF_VAULT_TOKEN": "hvs.a-legacy-export"}):
+            _, _, environment = self.run_cli(
+                ["--secret", "p", "--", "cmd"], mapping(PGUSER="cems"))
+        self.assertNotIn("ECMWF_VAULT_TOKEN", environment)
+        self.assertIn("HOME", environment)
 
     def test_each_value_is_revealed_exactly_once(self):
         fields = {"PGUSER": Recording("cems"), "PGPASSWORD": Recording("pw")}
@@ -295,11 +299,34 @@ class InProcessTests(unittest.TestCase):
                                       mapping(**{name: "x"}))
                 self.assertIn("refusing to set %s" % name, message)
 
-    def test_the_vault_token_is_refused_as_a_variable(self):
+    def test_a_credential_name_is_refused_as_a_variable(self):
+        # VAULT_TOKEN is HashiCorp's own variable: a secret that sets it authenticates the
+        # child somewhere the secret was never meant to reach.
+        message = self.refusal(["--secret", "p", "--force", "--", "cmd"],
+                              mapping(VAULT_TOKEN="another-token"))
+        self.assertIn("refusing to set VAULT_TOKEN", message)
+        self.assertIn("whose credential it holds", message)
+
+    def test_the_legacy_token_name_is_refused_as_a_variable(self):
+        # build_child_environment() strips this name from the child, so a field must not be
+        # able to put it back — that is the whole value of stripping it.
         message = self.refusal(["--secret", "p", "--force", "--", "cmd"],
                               mapping(ECMWF_VAULT_TOKEN="another-token"))
-        self.assertIn("refusing to put ECMWF_VAULT_TOKEN", message)
-        self.assertNotIn("no --force", message)   # a different refusal, not forceable
+        self.assertIn("refusing to set ECMWF_VAULT_TOKEN", message)
+        self.assertIn("whose credential it holds", message)
+
+    def test_a_renamed_field_cannot_become_the_legacy_token_name(self):
+        # --set renames, so the refusal has to cover the chosen variable name and not only
+        # whatever the Vault field happens to be called.
+        message = self.refusal(["--secret", "p", "--set", "ECMWF_VAULT_TOKEN=anything",
+                                "--force", "--", "cmd"], mapping(anything="x"))
+        self.assertIn("refusing to set ECMWF_VAULT_TOKEN", message)
+
+    def test_every_name_the_scrub_strips_is_refused_as_a_field(self):
+        # The two lists are one rule stated twice, so they are compared rather than trusted to
+        # stay aligned by hand.
+        from ecmwf_vault import _environment
+        self.assertIn(_environment.LEGACY_TOKEN_ENV, cli.FORBIDDEN_NAMES)
 
     def test_a_name_refusal_reveals_nothing(self):
         # The mapping/name/collision refusals run before the reveal() site, so they do
@@ -457,12 +484,15 @@ sys.exit(int(os.environ.get("STAND_IN_EXIT", "0")))
         """A deliberately small environment, so nothing is inherited by accident."""
         environment = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-            "PYTHONPATH": SOURCE,
+            "PYTHONPATH": _loopback_guard.child_python_path(SOURCE),
             "PYTHONDONTWRITEBYTECODE": "1",
             "LANG": "C.UTF-8",
             "HOME": self.home,
             "TMPDIR": self.scratch,
-            "ECMWF_VAULT_TOKEN": TOKEN,
+            "ECMWF_VAULT_TOKEN_FILE": _fakes.token_file(TOKEN),
+            # A stale export of the name an older version of this package authenticated with:
+            # the stand-in reports whether it arrived, so the strip is not taken on trust.
+            "ECMWF_VAULT_TOKEN": "hvs.a-legacy-export",
             "ECMWF_VAULT_ADDR": self.fake.base_url,
             "ECMWF_VAULT_CA_BUNDLE": self.fake.ca_bundle,
         }
@@ -507,11 +537,6 @@ sys.exit(int(os.environ.get("STAND_IN_EXIT", "0")))
         self.assertEqual(result.stdout,
                          "%s/%s" % (FIELDS["PGUSER"], FIELDS["PGPASSWORD"]))
 
-    def test_the_command_does_not_inherit_the_vault_token(self):
-        result = self.standard()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("ENV_HAS_TOKEN False", result.stdout)
-
     def test_nothing_is_left_behind_in_the_working_directory(self):
         result = self.standard()
         # Assert it ran first: otherwise this passes when the command never started,
@@ -530,6 +555,12 @@ sys.exit(int(os.environ.get("STAND_IN_EXIT", "0")))
         self.run_cli("--secret", SECRET_PATH, "--mount", "kv", "--", self.stand_in)
         self.assertEqual(self.fake.requests[-1].path,
                          "/v1/kv/data/%s" % SECRET_PATH)
+
+    def test_the_vault_token_is_not_handed_to_the_command(self):
+        # Reported by the child, from its own environment.
+        result = self.standard()
+        self.assertIn("ENV_HAS_TOKEN False", result.stdout)
+        self.assertNotIn("hvs.a-legacy-export", result.stdout + result.stderr)
 
     def test_the_commands_own_children_inherit_the_variables(self):
         # Not a feature: an environment is inherited. Pinned as a fact because
@@ -584,7 +615,7 @@ sys.exit(int(os.environ.get("STAND_IN_EXIT", "0")))
         self.assertNotIn("Traceback", result.stderr)
 
     def test_help_works_without_a_token_or_a_secret(self):
-        result = self.run_cli("--help", ECMWF_VAULT_TOKEN="")
+        result = self.run_cli("--help")
         self.assertEqual(result.returncode, 0)
         self.assertIn("vaultenv", result.stdout)
         self.assertIn("--secret", result.stdout)
@@ -599,7 +630,7 @@ sys.exit(int(os.environ.get("STAND_IN_EXIT", "0")))
         self.assertNotIn("ARGV", result.stdout)
 
     def test_a_vault_failure_is_reported_without_running_the_command(self):
-        result = self.standard(ECMWF_VAULT_TOKEN="")
+        result = self.standard(ECMWF_VAULT_TOKEN_FILE="")
         self.assertEqual(result.returncode, 2)
         self.assertIn("vaultenv:", result.stderr)
         self.assertNotIn("ARGV", result.stdout)
@@ -620,12 +651,8 @@ sys.exit(int(os.environ.get("STAND_IN_EXIT", "0")))
     def test_an_unsupported_interpreter_is_reported_without_running_the_command(self):
         # Take memfd_create away from the interpreter that runs the command, the way
         # a conda-forge build lacks it, and check the diagnosis reaches the user.
-        directory = tempfile.mkdtemp(prefix="ecmwf-vault-nosupport-")
-        self.addCleanup(shutil.rmtree, directory, True)
-        with open(os.path.join(directory, "sitecustomize.py"), "w",
-                  encoding="utf-8") as handle:
-            handle.write("import os\ndel os.memfd_create\n")
-        result = self.standard(PYTHONPATH="%s:%s" % (directory, SOURCE))
+        directory = _loopback_guard.sitecustomize_dir("import os\ndel os.memfd_create\n")
+        result = self.standard(PYTHONPATH=os.pathsep.join((directory, SOURCE)))
         self.assertEqual(result.returncode, 2)
         self.assertIn("os.memfd_create", result.stderr)
         self.assertNotIn("ARGV", result.stdout)

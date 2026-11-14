@@ -17,11 +17,11 @@ class VaultError(RuntimeError):
 
 
 class VaultTokenMissingError(VaultError):
-    """``ECMWF_VAULT_TOKEN`` is absent or blank."""
+    """No token source has a token: no command, and nothing usable in the token file."""
 
 
 class VaultTokenInvalidError(VaultError):
-    """``ECMWF_VAULT_TOKEN`` holds characters that cannot go in an HTTP header."""
+    """The token holds characters that cannot go in an HTTP header."""
 
 
 class SwapPolicyError(VaultError):
@@ -48,8 +48,8 @@ class VaultResponseError(VaultError):
     """Vault answered with a body this package refuses to interpret."""
 
 
-class VaultConfigFileError(VaultError):
-    """The Vault config file is missing, unreadable, unsafe or malformed."""
+class VaultTokenFileError(VaultError):
+    """The Vault token file is missing, unreadable, unsafe or oversized."""
 
 
 class SecretFieldMissingError(VaultError):

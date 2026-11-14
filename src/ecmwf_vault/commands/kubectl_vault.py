@@ -15,6 +15,10 @@ file is created and kubectl inherits no Vault token. kubectl itself is a trusted
 though, and it ends up holding the credential; read the limits below before treating this
 as confidential end to end.
 
+An expired token does not fail this command at its first refusal: it is replaced through the
+workflow in :mod:`ecmwf_vault._login` and the read is tried once more. With no terminal to ask
+on, that is reported and the command fails as any other read failure does.
+
 Exit status is kubectl's own, so this is usable in scripts and pipelines; a failure of the
 command itself — bad arguments, or a secret that could not be read — is ``2``. kubectl can
 return ``2`` as well, so the way to tell them apart is that these failures are the ones
@@ -43,9 +47,11 @@ Known limits, so they are not surprises:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
-from ecmwf_vault import SecretMemoryFile, VaultError, value
+from ecmwf_vault import _environment
+from ecmwf_vault import SecretMemoryFile, VaultError, _login, value
 
 from . import _command_contract as contract
 
@@ -116,7 +122,10 @@ def run(argv) -> int:
         options = parser.parse_args(ours)
 
     try:
-        fields = value(options.secret, mount=options.mount)
+        # A token that has run out is replaced and the read tried once more; anything the
+        # read refuses for another reason is reported unchanged.
+        fields = _login.run_retrying_once_if_token_lookup_refused(
+            lambda: value(options.secret, mount=options.mount), prefix=MESSAGE_PREFIX)
     except VaultError as error:
         contract.report_own_error(MESSAGE_PREFIX, str(error))
         return contract.EXIT_COMMAND_FAILED
@@ -128,7 +137,7 @@ def run(argv) -> int:
         if options.no_kubectl_cache:
             command.append("--cache-dir=/dev/null")
         command.extend(kubectl_arguments)
-        environment = contract.environment_without_token()
+        environment = _environment.child_environment()
         return contract.run_child(command, environment, message_prefix=MESSAGE_PREFIX,
                                    descriptor=memory.fd)
     finally:

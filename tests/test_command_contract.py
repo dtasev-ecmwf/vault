@@ -11,12 +11,10 @@ from __future__ import annotations
 
 import contextlib
 import io
-import os
 import sys
 import unittest
 from unittest import mock
 
-import _fakes
 from ecmwf_vault.commands import _command_contract as contract
 
 PREFIX = "a_command:"
@@ -32,21 +30,6 @@ class SplitAtSeparatorTests(unittest.TestCase):
     def test_a_separator_with_nothing_after_it_gives_an_empty_child_argv(self):
         self.assertEqual(contract.split_at_separator(["--secret", "p", "--"]),
                          (["--secret", "p"], []))
-
-
-class EnvironmentWithoutTokenTests(unittest.TestCase):
-    def test_the_token_is_removed_and_everything_else_is_kept(self):
-        with _fakes.vault_environment(ECMWF_VAULT_TOKEN="a-token"):
-            environment = contract.environment_without_token()
-        self.assertNotIn(contract.TOKEN_VARIABLE, environment)
-        self.assertIn("HOME", environment)
-
-    def test_the_process_environment_is_not_modified(self):
-        # It returns a copy: a command must not strip the token from its own process,
-        # because that is where the library reads it from.
-        with _fakes.vault_environment(ECMWF_VAULT_TOKEN="a-token"):
-            contract.environment_without_token()
-            self.assertEqual(os.environ[contract.TOKEN_VARIABLE], "a-token")
 
 
 class ReportOwnErrorTests(unittest.TestCase):

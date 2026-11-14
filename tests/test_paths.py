@@ -6,9 +6,11 @@ from __future__ import annotations
 import unittest
 
 from ecmwf_vault import InvalidSecretPathError, VaultError
+from ecmwf_vault import _paths
 from ecmwf_vault._paths import (
     MAX_MOUNT,
     MAX_PATH_BYTES,
+    build_cubbyhole_target,
     build_target,
     split_base_url,
     validate_mount,
@@ -62,6 +64,25 @@ class PathTests(unittest.TestCase):
                       "with space", "pct%2f"):
             with self.assertRaises(InvalidSecretPathError, msg=repr(mount)):
                 validate_mount(mount)
+
+    def test_the_cubbyhole_target_has_no_mount_choice_and_no_data_layer(self):
+        segments = validate_path(EXAMPLE)
+        self.assertEqual(build_cubbyhole_target(segments), "/v1/cubbyhole/" + EXAMPLE)
+        self.assertNotIn("/data/", build_cubbyhole_target(segments))
+
+    def test_the_cubbyhole_name_is_not_treated_as_a_mount(self):
+        # cubbyhole_read takes no mount, so the only way a caller reaches this engine is
+        # the dedicated builder. build_target with mount="cubbyhole" is the mistake to avoid:
+        # produces a path that exists on no Vault.
+        self.assertEqual(_paths.CUBBYHOLE, "cubbyhole")
+        self.assertNotEqual(build_target("cubbyhole", ("a",)),
+                            build_cubbyhole_target(("a",)))
+
+    def test_a_cubbyhole_path_is_validated_by_the_same_rules(self):
+        for path in ("", "..", "a/../b", "with space", "a/%2e%2e/b", "\ud800"):
+            with self.subTest(path=path):
+                with self.assertRaises(InvalidSecretPathError):
+                    validate_path(path)
 
     def test_permitted_punctuation_is_quoted_in_the_target(self):
         segments = validate_path("team/a+b@c.d-e_f")

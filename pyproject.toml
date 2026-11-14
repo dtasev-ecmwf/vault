@@ -10,7 +10,7 @@ name = "ecmwf-vault"
 description = "Read one ECMWF Vault secret and keep it off disk"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
-version = "0.2.0"
+version = "0.3.0"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = []
@@ -30,6 +30,9 @@ urls.Repository = "https://github.com/ecmwf/ecmwf-vault"
 # The installed commands. The library itself is imported, not run; the modules behind the
 # scripts are private to ecmwf_vault.commands, so the commands are the artefacts and not APIs.
 scripts.kubectl_vault = "ecmwf_vault.commands.kubectl_vault:main"
+scripts.vault_cubby = "ecmwf_vault.commands.vault_cubby:main"
+scripts.vault_expiry = "ecmwf_vault.commands.vault_expiry:main"
+scripts.vault_login = "ecmwf_vault.commands.vault_login:main"
 scripts.vaultenv = "ecmwf_vault.commands.vaultenv:main"
 
 [tool.setuptools.packages.find]

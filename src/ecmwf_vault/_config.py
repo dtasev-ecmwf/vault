@@ -1,23 +1,25 @@
 # SPDX-FileCopyrightText: 2026 European Centre for Medium-Range Weather Forecasts (ECMWF)
 # SPDX-License-Identifier: Apache-2.0
-"""Where the Vault token comes from: the environment, then a private config file.
+"""Where the Vault token comes from: the token file.
 
-Precedence is ``ECMWF_VAULT_TOKEN`` first, then ``~/.ecmwf-vault/config``. That
-ordering matches HashiCorp's own CLI (``VAULT_TOKEN`` overrides
-``~/.vault-token``), and it means a caller that already supplies the token in the
-environment is unaffected by this file existing.
+``~/.ecmwf-vault/token`` holds the token and nothing else, sealed with a passphrase derived
+from the account. ``vault_login`` fills it; :mod:`ecmwf_vault._sealed_token_file` is the
+format.
 
-A source that is *absent or blank* falls through to the next one; a source that
-is *present but cannot be a token* is an error, never a silent fall-through.
-Using a different credential than the one the caller supplied would be exactly
-the class of surprise this package exists to avoid.
+A token found in the clear is sealed in place before it is used, and the fact is printed.
+Sealing is part of reading: a credential this package cannot seal is one it does not use.
 
-The config file is read as data and never executed, and its permissions are
-enforced the way OpenSSH enforces key permissions: a file another user could
-read or write is refused rather than used. The directory holding it is held to the
-same rule, because a directory another user can reach lets them list, replace or
-add to what sits in it — the file's own mode protects its contents, the directory's
-protects its existence and its integrity.
+Nothing is cached. Every call reads and decrypts the file, so a re-login takes effect on the
+call after it.
+
+Permissions are enforced the way OpenSSH enforces key permissions, with no policy to relax
+them: a file another user could read or write, or one you do not own, is refused, and so is
+the directory holding it — the directory is what lets another user list the file, replace it,
+or add one beside it. A symlink, a non-regular file and an oversized file are refused at any
+mode. Errors name the mode required, never the content.
+
+This decides where the token is read from and whether it is safe to read. It does not protect
+the token from a process running as you, or from root.
 """
 from __future__ import annotations
 
@@ -25,26 +27,21 @@ import errno
 import os
 import re
 import stat
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 
+from . import _sealed_token_file
 from ._errors import (
-    VaultConfigFileError,
+    VaultError,
+    VaultTokenFileError,
     VaultTokenInvalidError,
     VaultTokenMissingError,
 )
 from ._policy import warn_once
 
-CONFIG_ENV = "ECMWF_VAULT_CONFIG"
-POLICY_ENV = "ECMWF_VAULT_CONFIG_POLICY"
-DEFAULT_CONFIG = "~/.ecmwf-vault/config"
-TOKEN_KEY = "ECMWF_VAULT_TOKEN"
+TOKEN_FILE_ENV = "ECMWF_VAULT_TOKEN_FILE"
+DEFAULT_TOKEN_FILE = "~/.ecmwf-vault/token"
 
-POLICY_REFUSE = "refuse"
-POLICY_WARN = "warn"
-POLICY_ALLOW = "allow"
-POLICIES = (POLICY_REFUSE, POLICY_WARN, POLICY_ALLOW)
-
-MAX_CONFIG_BYTES = 64 * 1024
+MAX_TOKEN_BYTES = 64 * 1024
 READ_SIZE = 4096
 
 # A Vault token is printable ASCII with no space. This is not tidiness:
@@ -53,7 +50,6 @@ READ_SIZE = 4096
 # both messages carry the token. A NUL or other control character must never
 # reach a header either.
 _TOKEN = re.compile(r"[!-~]+")
-_QUOTES = "\"'"
 
 # O_NONBLOCK matters here: opening a FIFO read-only would otherwise block until a
 # writer appears, before the regular-file check below can reject it.
@@ -61,73 +57,93 @@ _OPEN_FLAGS = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
                | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0))
 
 MISSING_MESSAGE = (
-    "ECMWF_VAULT_TOKEN is not set and no token is configured in the config file")
-MISSING_FILE_MESSAGE = "the Vault config file named by ECMWF_VAULT_CONFIG does not exist"
+    "no Vault token: the token file holds nothing; run vault_login to fetch one")
+MISSING_FILE_MESSAGE = (
+    "the Vault token file named by ECMWF_VAULT_TOKEN_FILE does not exist")
 INVALID_TOKEN_MESSAGE = (
     "the Vault token contains characters that cannot be sent in a header")
-POLICY_MESSAGE = "ECMWF_VAULT_CONFIG_POLICY must be one of refuse, warn or allow"
-UNREADABLE_MESSAGE = "the Vault config file could not be read"
+UNREADABLE_MESSAGE = "the Vault token file could not be read"
 SYMLINK_MESSAGE = (
-    "the Vault config file is a symlink; point ECMWF_VAULT_CONFIG at the real path")
-NOT_FILE_MESSAGE = "the Vault config file is not a regular file"
-TOO_LARGE_MESSAGE = "the Vault config file is too large"
-ENCODING_MESSAGE = "the Vault config file is not valid UTF-8 text"
-OWNER_MESSAGE = "the Vault config file is not owned by the current user"
+    "the Vault token file is a symlink; point ECMWF_VAULT_TOKEN_FILE at the real path")
+NOT_FILE_MESSAGE = "the Vault token file is not a regular file"
+TOO_LARGE_MESSAGE = "the Vault token file is too large"
+ENCODING_MESSAGE = "the Vault token file is not valid UTF-8 text"
+OWNER_MESSAGE = "the Vault token file is not owned by the current user"
 MODE_MESSAGE = (
-    "the Vault config file is readable or writable by another user "
-    "(make it mode 600)")
+    "the Vault token file is readable or writable by another user (make it mode 600)")
 DIRECTORY_OWNER_MESSAGE = (
-    "the directory holding the Vault config file is not owned by the current user")
+    "the directory holding the Vault token file is not owned by the current user")
 DIRECTORY_MESSAGE = (
-    "the directory holding the Vault config file is readable or writable by another "
+    "the directory holding the Vault token file is readable or writable by another "
     "user (make it mode 700)")
-SYNTAX_MESSAGE = "the Vault config file has a malformed entry"
-UNSUPPORTED_MESSAGE = "the Vault config file has an unsupported entry"
-DUPLICATE_MESSAGE = "the Vault config file sets the same entry twice"
-QUOTED_MESSAGE = "the Vault config file must not quote the token value"
 
 
-def resolve_policy(explicit: Optional[str] = None) -> str:
-    """Resolve the config-file permission policy.
+def token_file_path() -> Tuple[str, bool]:
+    """Return ``(path, was_named)`` for the token file.
 
-    Unlike the swap policy this has no constructor argument: the token source is
-    deliberately resolved per call rather than held as client state.
+    ``was_named`` is true when the caller asked for a specific file, in which case a missing
+    file is an error rather than "no token file configured".
     """
-    if explicit is None:
-        explicit = os.environ.get(POLICY_ENV, POLICY_REFUSE)
-    if not isinstance(explicit, str) or explicit not in POLICIES:
-        raise VaultConfigFileError(POLICY_MESSAGE)
-    return explicit
-
-
-def config_path() -> Tuple[str, bool]:
-    """Return ``(path, was_named)`` for the config file.
-
-    ``was_named`` is true when the caller asked for a specific file, in which case
-    a missing file is an error rather than "no config file configured".
-    """
-    named = os.environ.get(CONFIG_ENV)
+    named = os.environ.get(TOKEN_FILE_ENV)
     if isinstance(named, str) and named.strip():
         return named.strip(), True
-    return os.path.expanduser(DEFAULT_CONFIG), False
+    return os.path.expanduser(DEFAULT_TOKEN_FILE), False
 
 
-def resolve_token(explicit_policy: Optional[str] = None) -> str:
-    """Return the Vault token from the environment or the config file."""
-    from_environment = os.environ.get(TOKEN_KEY)
-    if isinstance(from_environment, str) and from_environment.strip():
-        return validated(from_environment.strip())
+def resolve_token() -> str:
+    """Return the Vault token, read from the token file.
 
-    path, was_named = config_path()
-    entries = read_config(path, resolve_policy(explicit_policy))
-    if entries is None:
+    Read fresh on every call; nothing is cached. See the module docstring for what is refused
+    and what :func:`token_in_file` does about a file in the clear.
+    """
+    path, was_named = token_file_path()
+    content = read_token_file(path)
+    if content is None:
         if was_named:
-            raise VaultConfigFileError(MISSING_FILE_MESSAGE)
+            raise VaultTokenFileError(MISSING_FILE_MESSAGE)
         raise VaultTokenMissingError(MISSING_MESSAGE)
-    token = entries.get(TOKEN_KEY)
-    if token is None or not token.strip():
+    if not content.strip():
+        # A file that exists but is empty or whitespace: nothing to use, and nothing wrong with
+        # the file itself, so this is the same "no token" as no file at all.
         raise VaultTokenMissingError(MISSING_MESSAGE)
-    return validated(token.strip())
+    return validated(token_in_file(content, path))
+
+
+def token_in_file(content: bytes, path: str) -> str:
+    """The token in the token file's content.
+
+    No ``hvs.`` prefix means the content is a cipher, and it is unsealed. The prefix means a
+    token in the clear: it is checked, sealed in place, and only then returned. A file that is
+    neither is refused by :mod:`ecmwf_vault._sealed_token_file`, whose message names the
+    account the passphrase is derived from — another account, or another machine, is the usual
+    reason a sealed file will not open here.
+    """
+    if not _sealed_token_file.plaintext(content):
+        return _sealed_token_file.unseal(content)
+    try:
+        token = validated(content.strip().decode("utf-8"))
+    except UnicodeDecodeError:
+        raise VaultTokenFileError(ENCODING_MESSAGE) from None
+    seal_in_place(path, token)
+    return token
+
+
+def seal_in_place(path: str, token: str) -> None:
+    """Seal a token file found in the clear, or refuse the token.
+
+    Writing the sealed form is part of reading it. Continuing after a failed seal would leave
+    a credential on disk as text and report success, so the failure is raised with what to fix.
+    The message beneath it is one of this package's own and carries no token.
+    """
+    try:
+        _sealed_token_file.write(path, token)
+    except (VaultError, OSError) as error:
+        raise VaultTokenFileError(
+            "the Vault token file holds a token in the clear that could not be sealed (%s); "
+            "make the file writable, or replace it with a sealed one" % error) from None
+    warn_once("token-file-sealed",
+              "ecmwf-vault: %s held a token in the clear and has been sealed with the "
+              "passphrase derived from your account" % path)
 
 
 def validated(token: object) -> str:
@@ -137,13 +153,17 @@ def validated(token: object) -> str:
     return token
 
 
-def read_config(path: str, policy: str) -> Optional[Dict[str, str]]:
-    """Read and parse the config file, or return None when there is no file.
+def read_token_file(path: str) -> Optional[bytes]:
+    """Read the token file as bytes, or return None when there is no file.
 
-    Symlinks, non-regular files and oversized files are refused whatever the
-    policy says; ownership and group/other mode bits are what the policy governs,
-    so ``allow`` is a deliberate escape hatch for an unusual situation rather
-    than a way to read a shared file by accident.
+    Bytes and not text, because a *sealed* file is a gpg message: decoding it as UTF-8 would
+    fail on a file this package wrote itself. What the bytes mean — a token in the clear or a
+    sealed one — is :func:`token_in_file`'s question, not this one's.
+
+    Symlinks, non-regular files and oversized files are refused as unreadable. Ownership and
+    the group/other mode bits are refused by :func:`check_permissions` and
+    :func:`check_directory_permissions`, unconditionally: there is no policy that lets an
+    accessible credential be used.
     """
     try:
         descriptor = os.open(path, _OPEN_FLAGS)
@@ -151,32 +171,20 @@ def read_config(path: str, policy: str) -> Optional[Dict[str, str]]:
         return None
     except OSError as error:
         if error.errno == errno.ELOOP:
-            raise VaultConfigFileError(SYMLINK_MESSAGE) from None
-        raise VaultConfigFileError(UNREADABLE_MESSAGE) from None
+            raise VaultTokenFileError(SYMLINK_MESSAGE) from None
+        raise VaultTokenFileError(UNREADABLE_MESSAGE) from None
     try:
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode):
-            raise VaultConfigFileError(NOT_FILE_MESSAGE)
-        if info.st_size > MAX_CONFIG_BYTES:
-            raise VaultConfigFileError(TOO_LARGE_MESSAGE)
-        check_permissions(info, policy)
-        check_directory_permissions(path, policy)
+            raise VaultTokenFileError(NOT_FILE_MESSAGE)
+        if info.st_size > MAX_TOKEN_BYTES:
+            raise VaultTokenFileError(TOO_LARGE_MESSAGE)
+        check_permissions(info)
+        check_directory_permissions(path)
         raw = read_all(descriptor)
     finally:
         os.close(descriptor)
-    return parse(decode(raw))
-
-
-def apply_policy(problem: Optional[str], policy: str, key: str) -> None:
-    """Raise, or warn once, about a permission problem that was found."""
-    if problem is None:
-        return
-    if policy == POLICY_REFUSE:
-        raise VaultConfigFileError(problem)
-    # Both relaxed policies warn, exactly as the swap policy does: there is
-    # deliberately no silent way to run with a token another user can read.
-    warn_once(key, "ecmwf-vault: %s (continuing because %s=%s)"
-              % (problem, POLICY_ENV, policy))
+    return bytes(raw)
 
 
 def problem_with(info: os.stat_result, owner_message: str,
@@ -189,34 +197,36 @@ def problem_with(info: os.stat_result, owner_message: str,
     return None
 
 
-def check_permissions(info: os.stat_result, policy: str) -> None:
-    """Refuse (or warn once about) a file another user could read or write."""
-    apply_policy(problem_with(info, OWNER_MESSAGE, MODE_MESSAGE),
-                 policy, "config-permissions")
+def check_permissions(info: os.stat_result) -> None:
+    """Refuse a file another user could read or write, or that is not ours."""
+    problem = problem_with(info, OWNER_MESSAGE, MODE_MESSAGE)
+    if problem is not None:
+        raise VaultTokenFileError(problem)
 
 
-def check_directory_permissions(path: str, policy: str) -> None:
-    """Refuse (or warn once about) a config directory another user could reach.
+def check_directory_permissions(path: str) -> None:
+    """Refuse a token directory another user could reach.
 
-    The same rule as the file, because the directory is what lets another user list
-    the file, replace it, or add something beside it. A symlinked directory is
-    resolved first: what matters is the mode of wherever the file actually lives,
-    which is also where an attacker would have to reach.
+    The same rule as the file, because the directory is what lets another user list the file,
+    replace it, or add something beside it. A symlinked directory is resolved first: what
+    matters is the mode of wherever the file actually lives, which is also where an attacker
+    would have to reach.
+
+    A directory that cannot be stat'd is left alone: the file was opened, so the directory
+    going away between the two calls is a race rather than a misconfiguration.
     """
     directory = os.path.dirname(os.path.realpath(path))
     try:
         info = os.stat(directory)
     except OSError:
-        # The directory went away between opening the file and looking at it. The
-        # file was opened, so this is a race rather than a misconfiguration, and
-        # the open itself already succeeded or failed on its own merits.
         return
-    apply_policy(problem_with(info, DIRECTORY_OWNER_MESSAGE, DIRECTORY_MESSAGE),
-                 policy, "config-directory-permissions")
+    problem = problem_with(info, DIRECTORY_OWNER_MESSAGE, DIRECTORY_MESSAGE)
+    if problem is not None:
+        raise VaultTokenFileError(problem)
 
 
 def read_all(descriptor: int) -> bytes:
-    """Read at most MAX_CONFIG_BYTES, re-checking as we go."""
+    """Read at most MAX_TOKEN_BYTES, re-checking as we go."""
     chunks = []
     total = 0
     while True:
@@ -224,42 +234,6 @@ def read_all(descriptor: int) -> bytes:
         if not chunk:
             return b"".join(chunks)
         total += len(chunk)
-        if total > MAX_CONFIG_BYTES:
-            raise VaultConfigFileError(TOO_LARGE_MESSAGE)
+        if total > MAX_TOKEN_BYTES:
+            raise VaultTokenFileError(TOO_LARGE_MESSAGE)
         chunks.append(chunk)
-
-
-def decode(raw: bytes) -> str:
-    """Decode the file as UTF-8, or raise a fixed error."""
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
-        raise VaultConfigFileError(ENCODING_MESSAGE) from None
-
-
-def parse(text: str) -> Dict[str, str]:
-    """Parse ``KEY=VALUE`` lines without ever echoing their contents.
-
-    Blank lines and lines starting with ``#`` are ignored; the value is taken
-    literally apart from surrounding whitespace, and quoting it is refused rather
-    than guessed at. Errors carry the line number and nothing else, because a
-    malformed file can put a secret in the key position.
-    """
-    entries: Dict[str, str] = {}
-    for number, raw_line in enumerate(text.splitlines(), start=1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        key, separator, value = line.partition("=")
-        key = key.strip()
-        if not separator:
-            raise VaultConfigFileError("%s (line %d)" % (SYNTAX_MESSAGE, number))
-        if key != TOKEN_KEY:
-            raise VaultConfigFileError("%s (line %d)" % (UNSUPPORTED_MESSAGE, number))
-        if key in entries:
-            raise VaultConfigFileError("%s (line %d)" % (DUPLICATE_MESSAGE, number))
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in _QUOTES:
-            raise VaultConfigFileError("%s (line %d)" % (QUOTED_MESSAGE, number))
-        entries[key] = value
-    return entries
