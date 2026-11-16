@@ -46,14 +46,29 @@ class RunChildTests(unittest.TestCase):
             status = contract.run_child(["cmd"], {"A": "1"}, message_prefix=PREFIX)
         self.assertEqual(status, 42)
         self.assertEqual(child.call.call_args.args[0], ["cmd"])
-        self.assertEqual(child.call.call_args.kwargs["env"], {"A": "1"})
+        environment = child.call.call_args.kwargs["env"]
+        # Compared key by key rather than as a dict: an assertion handed a whole environment
+        # prints all of it when it fails, and the rule cannot tell this dict from the real
+        # thing, so it does not try to.
+        self.assertEqual(sorted(environment), ["A"], "exactly the variables asked for")
+        self.assertEqual(environment["A"], "1")
         self.assertNotIn("pass_fds", child.call.call_args.kwargs)
 
-    def test_a_descriptor_is_inherited_when_one_is_given(self):
+    def test_descriptors_are_inherited_when_given(self):
+        # Several at once, because a command may hand over a kubeconfig *and* a certificate,
+        # and the numbers must survive unchanged — /proc/self/fd/<n> is only right if they do.
         with mock.patch.object(contract, "subprocess") as child:
             child.call.return_value = 0
-            contract.run_child(["cmd"], {}, message_prefix=PREFIX, descriptor=7)
-        self.assertEqual(child.call.call_args.kwargs["pass_fds"], (7,))
+            contract.run_child(["cmd"], {}, message_prefix=PREFIX, descriptors=(7, 9))
+        self.assertEqual(child.call.call_args.kwargs["pass_fds"], (7, 9))
+
+    def test_nothing_extra_is_inherited_without_descriptors(self):
+        # The default must not add pass_fds at all: passing an empty tuple is a different
+        # instruction to subprocess than passing nothing.
+        with mock.patch.object(contract, "subprocess") as child:
+            child.call.return_value = 0
+            contract.run_child(["cmd"], {}, message_prefix=PREFIX)
+        self.assertNotIn("pass_fds", child.call.call_args.kwargs)
 
     def test_a_child_that_does_not_exist_is_127(self):
         with mock.patch.object(contract, "subprocess") as child:

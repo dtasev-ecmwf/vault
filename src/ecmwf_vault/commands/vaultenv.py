@@ -3,22 +3,22 @@
 """The ``vaultenv`` command: run a command with environment variables read from Vault.
 
 Installed as a console script by ``pip install ecmwf-vault`` (``pyproject.toml`` maps
-``vaultenv`` to :func:`main`); this module is private, and the command is the public
-artefact. Run it from a checkout with ``python -m ecmwf_vault.commands.vaultenv``.
+``vaultenv`` to :func:`main`); this module is private, and the command is the public artefact.
+Run it from a checkout with ``python -m ecmwf_vault.commands.vaultenv``.
 
     vaultenv --secret user_applications_and_services_team/cems_web/db -- psql
 
-With no selection, every field of the secret becomes an environment variable of the same
-name. ``--field NAME`` uses only that field, under its own name, and is the way to take one
-value out of a secret whose other fields are not valid variable names (Vault field names may
-contain ``-`` or ``.``); ``--set NAME=FIELD`` uses only the fields you list, renaming them.
-Both options are repeatable, and both select, so mixing them is simply the union.
-Nothing is written to disk and no file is created: the variables exist only in the command
-this runs and in anything that command runs in turn.
+With no selection, every field of the secret becomes an environment variable of the same name.
+``--field NAME`` uses only that field, under its own name, and is the way to take one value out
+of a secret whose other fields are not valid variable names (Vault field names may contain
+``-`` or ``.``); ``--set NAME=FIELD`` uses only the fields you list, renaming them. Both
+options are repeatable, and both select, so mixing them is simply the union. Nothing is written
+to disk and no file is created: the variables exist only in the command this runs and in
+anything that command runs in turn.
 
-Read this next part, because this command is weaker than the ``kubectl_vault`` one
-and the difference is not a detail. An environment variable *is* plaintext in the child's
-memory, so there is no sealed descriptor to hand over:
+Read this next part, because this command is weaker than the ``kubectl_vault`` one and the
+difference is not a detail. An environment variable *is* plaintext in the child's memory, so
+there is no sealed descriptor to hand over:
 
 * Any process running as the same user can read ``/proc/<child-pid>/environ`` for as long
   as the child lives, whether or not the child cooperates.
@@ -30,19 +30,18 @@ memory, so there is no sealed descriptor to hand over:
 * The child can print them (``env``, ``printenv``, ``/proc/self/environ``) and anything
   that logs its environment will.
 
-So the guarantee is "this never creates a file and never writes a secret to disk", which
-is what the library promises, and **not** "the value is confined to the process that
-needs it". The library's :class:`~ecmwf_vault.Secret` refuses environment assignment to
-stop a caller doing this by accident; this command does it on purpose, which is why it
-exists as a separate, named command rather than as an API. If the distinction matters, use
-the ``kubectl_vault`` command and its descriptor handover, keep the child's lifetime short,
-and isolate the invocation (a container with a read-only root filesystem, or a separate
-account).
+So the guarantee is "this never creates a file and never writes a secret to disk", which is
+what the library promises, and **not** "the value is confined to the process that needs it".
+The library's :class:`~ecmwf_vault.Secret` refuses environment assignment to stop a caller
+doing this by accident; this command does it on purpose, which is why it exists as a separate,
+named command rather than as an API. If the distinction matters, use the ``kubectl_vault``
+command and its descriptor handover, keep the child's lifetime short, and isolate the
+invocation (a container with a read-only root filesystem, or a separate account).
 
 Two refusals. A field whose name would overwrite a variable the child already has is an error
 unless ``--force`` is given. A name on a fixed list is refused outright, with no override,
-because a secret must not decide any of the five things that list covers: what the child **runs**
-(``PATH``, ``GIT_SSH_COMMAND``, the pagers and editors), which code it **loads**
+because a secret must not decide any of the five things that list covers: what the child
+**runs** (``PATH``, ``GIT_SSH_COMMAND``, the pagers and editors), which code it **loads**
 (``LD_PRELOAD``, ``PYTHONPATH``, the Java/Node/Ruby/Lua startup paths), what it **trusts** (the
 trust-anchor variables), where it **writes key material** (``SSLKEYLOGFILE``), and whose
 **credential** it holds (``VAULT_TOKEN``, HashiCorp's vault CLI variable).
@@ -52,36 +51,36 @@ every variable some program reads as an instruction. Beyond it the judgement is 
 which is why ``--force`` is explicit and why a secret's field names must be as trusted as its
 values.
 
-Name refusals run before any value is revealed, so they reveal nothing. Value refusals — a field
-that is not text, or holds a NUL — can only be found by revealing, and stop before a partial
-environment is handed over. A field's *text* is never printed, only its name and type.
+Name refusals run before any value is revealed, so they reveal nothing. Value refusals — a
+field that is not text, or holds a NUL — can only be found by revealing, and stop before a
+partial environment is handed over. A field's *text* is never printed, only its name and type.
 
 An expired token is replaced and the read retried once, through the workflow in
 :mod:`ecmwf_vault._login`. With no terminal to ask on, that is reported and the command fails.
 
 Exit status is the child's own, so this drops into scripts and pipelines; a failure of the
-command itself — bad arguments, a refused name, a secret that could not be read, or a
-command that could not be started at all — is ``2`` (``127`` when there is no such
-command), printed to stderr with a ``vaultenv:`` prefix so it can be told from a child that
-also exits ``2``. Anything after ``--`` goes to the command verbatim; without ``--``, any
-argument this command does not recognise is passed through.
+command itself — bad arguments, a refused name, a secret that could not be read, or a command
+that could not be started at all — is ``2`` (``127`` when there is no such command), printed to
+stderr with a ``vaultenv:`` prefix so it can be told from a child that also exits ``2``.
+Anything after ``--`` goes to the command verbatim; without ``--``, any argument this command
+does not recognise is passed through.
 """
 from __future__ import annotations
 
 import argparse
 import os
-import re
 import sys
 
 from ecmwf_vault import _environment
 from ecmwf_vault import VaultError, _login, value
 
 from . import _command_contract as contract
+from ._memory_slots import MemorySlots, environment_file_text
 
 MESSAGE_PREFIX = "vaultenv:"
 # POSIX names only: a Vault field may be called "k8s-cems-test", an environment
 # variable may not.
-NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+NAME_PATTERN = contract.IDENTIFIER
 
 # Names through which a secret would decide something about the child. Refused outright;
 # --force does not cover them. Five risks, each named in the refusal message:
@@ -152,6 +151,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="use exactly these fields, renaming them; repeatable")
     parser.add_argument("--force", action="store_true",
                         help="overwrite variables the command already has")
+    parser.add_argument("--mem-file", metavar="NICKNAME", default=None,
+                        help="put the selected variables in a sealed memory file under this "
+                             "name, and pass it to the command as {NICKNAME} instead of "
+                             "exporting them; the field(s) are left out of the environment")
+    parser.add_argument("--mem-field", action="append", default=[], metavar="NAME:NICKNAME",
+                        help="put one field's raw text in a sealed memory file under NICKNAME "
+                             "and pass it as {NICKNAME}; repeatable. The field is left out of "
+                             "the environment either way")
     return parser
 
 
@@ -195,12 +202,63 @@ def map_variable(wanted, variable, field_name) -> None:
     wanted[variable] = field_name
 
 
-def variable_mapping(selected, renamed, fields):
+def refuse_forbidden_nickname(nickname):
+    """Refuse a nickname that reads like one of the names no secret may set.
+
+    A nickname is not a variable name: ``{LD_PRELOAD}`` sets nothing, and the contents of the
+    slot have already been through :func:`refuse_forbidden_names`. But a flag that appears to
+    name a loader is worth a second look from whoever reads the command line later, and giving
+    a slot some other word costs nothing.
+    """
+    if nickname in FORBIDDEN_NAMES or nickname.startswith(FORBIDDEN_PREFIXES):
+        raise SystemExit(
+            "%r is a name this command will not use, even as a nickname for a memory file: it "
+            "is on the list of variables a secret may not set, and reusing it here would only "
+            "make the next reader wonder whether it does" % nickname)
+
+
+def split_mem_field(item):
+    """``NAME:NICKNAME`` as two parts, splitting on the *last* colon.
+
+    Vault field names are whatever the server returned and may contain colons; nicknames are
+    identifiers and may not. Splitting from the right and requiring the tail to be a valid
+    identifier is therefore unambiguous: ``a:b:c`` is field ``a:b`` under nickname ``c``.
+    """
+    field_name, separator, nickname = item.rpartition(":")
+    if not separator or not field_name or not nickname:
+        raise SystemExit("--mem-field takes NAME:NICKNAME, not %r" % item)
+    return field_name, nickname
+
+
+def raw_field(fields, field_name):
+    """One field's text as bytes, checked exactly the way a variable's value is.
+
+    Reusing :func:`variable_values` rather than repeating its refusals is deliberate: the rules
+    about what may leave Vault as text — no structure, no NUL, nothing unencodable — must not
+    be able to drift between the two routes out.
+
+    The bytes come from ``os.fsencode``, the very call :func:`variable_values` uses to
+    decide whether text may be exported at all. Strict UTF-8 instead would raise
+    ``UnicodeEncodeError`` on a value the environment route accepts: a lone surrogate in the
+    U+DC80 to U+DCFF range passes ``os.fsencode``, which is how it round-trips an undecodable
+    byte, and that exception *object* holds the text, so ``repr()`` of it contains the
+    secret.
+    """
+    require_field(field_name, fields)
+    text = variable_values(fields, {field_name: field_name})[field_name]
+    return os.fsencode(text)
+
+
+def variable_mapping(selected, renamed, fields, exclude=()):
     """The variable-to-field mapping to use, or explain what is wrong with it.
 
     ``selected`` is ``--field``: use this field, under its own name. ``renamed`` is
     ``--set NAME=FIELD``: use this field, renamed. Both select, so mixing them is the
     union; with neither, every field of the secret is used as it is.
+
+    ``exclude`` names fields going to a memory file instead. They are left out of the default
+    mapping rather than refused by it, so a secret whose only field is held in a descriptor
+    works — and their names are never checked as variable names, because they never become one.
     """
     if not fields:
         raise SystemExit("that secret has no fields, so there is nothing to set")
@@ -219,20 +277,28 @@ def variable_mapping(selected, renamed, fields):
     if wanted:
         return wanted
     for field_name in fields:
+        if field_name in exclude:
+            continue
         require_name(field_name)
         map_variable(wanted, field_name, field_name)
     return wanted
 
 
-def build_child_environment(wanted, force):
+def build_child_environment(wanted, force, check_clashes=True):
     """This environment without the legacy token name, once the overwrites are agreed to.
 
     The scrub happens here and the fields are applied by the caller, so a field named
     ``ECMWF_VAULT_TOKEN`` would put back what was just removed. :data:`FORBIDDEN_NAMES` holds
     that name for exactly that reason.
+
+    ``check_clashes`` is off only when the selection goes to a memory file instead of the
+    environment: nothing named there is overwritten, so a clash refusal would report a failure
+    this command cannot cause. The forbidden-name refusal is unaffected, because whoever reads
+    that file is going to export what is in it.
     """
     environment = _environment.child_environment()
-    clashes = sorted(name for name in wanted if name in environment)
+    clashes = sorted(name for name in wanted
+                     if name in environment) if check_clashes else []
     if clashes and not force:
         raise SystemExit(
             "these variables are already set, and the secret would overwrite them: %s\n"
@@ -290,13 +356,49 @@ def run(argv) -> int:
         contract.report_own_error(MESSAGE_PREFIX, str(error))
         return contract.EXIT_COMMAND_FAILED
 
-    wanted = variable_mapping(options.field, options.set, fields)
-    refuse_forbidden_names(wanted)
-    environment = build_child_environment(wanted, options.force)
-    # variable_values returns a complete mapping or raises, so a refusal here
-    # cannot leave a half-built environment behind.
-    environment.update(variable_values(fields, wanted))
-    return contract.run_child(command, environment, message_prefix=MESSAGE_PREFIX)
+    slots = MemorySlots()
+    try:
+        # Slots are taken before the mapping is built: a field going to a descriptor is not a
+        # variable, and its name is never checked as one.
+        held = [(field_name, nickname) for field_name, nickname in
+                (split_mem_field(item) for item in options.mem_field)]
+        wanted = variable_mapping(options.field, options.set, fields,
+                                  exclude={name for name, _ in held})
+        refuse_forbidden_names(wanted)
+        for field_name, nickname in held:
+            if field_name in wanted.values():
+                raise SystemExit(
+                    "field %r was asked for twice: as memory file %r and as a variable. "
+                    "Choose one — a value in a descriptor is not in the environment, which "
+                    "is the point" % (field_name, nickname))
+        # A selection headed for a memory file overwrites nothing in the environment, so the
+        # clash check would refuse a command that could not have failed.
+        environment = build_child_environment(wanted, options.force,
+                                              check_clashes=options.mem_file is None)
+        # variable_values returns a complete mapping or raises, so a refusal here
+        # cannot leave a half-built environment behind.
+        values = variable_values(fields, wanted)
+        for field_name, nickname in held:
+            refuse_forbidden_nickname(nickname)
+            slots.add(nickname, raw_field(fields, field_name))
+        if options.mem_file is not None:
+            # ``is not None`` and not a truth test: ``--mem-file=`` was given, and treating it
+            # as though the flag were absent would export the secret instead of sealing it,
+            # silently, with an exit status of 0.
+            refuse_forbidden_nickname(options.mem_file)
+            # The selection goes to the descriptor *instead of* the environment: exporting it
+            # as well would put the same values in /proc/<pid>/environ, where anything sharing
+            # this uid can read them for the child's whole lifetime, and buy nothing.
+            slots.add(options.mem_file, environment_file_text(values))
+        else:
+            environment.update(values)
+        return contract.run_child(slots.substitute(command), environment,
+                                  message_prefix=MESSAGE_PREFIX,
+                                  descriptors=slots.descriptors())
+    finally:
+        # Our end of each descriptor stays open until the child has finished: the file itself
+        # outlives this only because the child inherited a reference to it.
+        slots.close()
 
 
 def main() -> int:

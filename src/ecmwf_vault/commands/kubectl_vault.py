@@ -139,7 +139,7 @@ def run(argv) -> int:
         command.extend(kubectl_arguments)
         environment = _environment.child_environment()
         return contract.run_child(command, environment, message_prefix=MESSAGE_PREFIX,
-                                   descriptor=memory.fd)
+                                  descriptors=(memory.fd,))
     finally:
         memory.close()
 

@@ -550,6 +550,75 @@ Worth knowing:
 - Exit status is the command's own; `2` means the wrapper failed, and the wrapper's
   failures are the ones carrying the `vaultenv:` stderr prefix.
 
+### Passing a secret as a descriptor instead of a variable
+
+The environment is the broadly-copied place: every program the child spawns inherits its
+variables, `ps eww` and container-inspection tooling read them, and anything that logs an
+environment logs the secret. A descriptor is not copied that way — the value stays in a sealed
+anonymous memory file and the child reaches it by number.
+
+What that does **not** buy is confidentiality from someone who is already you. A process running
+as the same uid, or root, can open the child's `/proc/<pid>/fd/<n>` and read the bytes; the seal
+prevents *writing*, not reading. This is the same limit stated in
+[What it does not guarantee](#what-it-does-not-guarantee), and the descriptor route narrows where
+the plaintext *spreads*, not who can read it. Two flags choose that route, and each slot is
+referred to by a nickname you invent rather than by a file descriptor number:
+
+| | |
+| --- | --- |
+| `--mem-field=NAME:NICKNAME` | put field `NAME`'s text in a memory file, addressable as `{NICKNAME}`; repeatable |
+| `--mem-file=NICKNAME` | put the whole selection in a memory file in `NAME=value` form, addressable as `{NICKNAME}` |
+
+```console
+$ vaultenv --secret groups/…/k8s --mem-field=kubeconfig:kube -- \
+    kubectl --kubeconfig '{kube}' -n glofas-stage get pods
+```
+
+Write `{kube}` where the program wants a path. Before the child starts, this command replaces it
+with `/proc/self/fd/<n>` for whatever number the kernel assigned — you never see it, and it cannot
+mismatch. Both a whole argument and an embedded one are replaced, so `--kubeconfig={kube}` works
+too. Quote the token (`'{kube}'`) so nothing before this command touches it.
+
+**What goes to a descriptor does not also go to the environment.** A field named by `--mem-field`
+is left out of the variables the command would otherwise export, and `--mem-file` replaces the
+exporting entirely rather than adding to it. Exporting both would put the same values in
+`/proc/<pid>/environ`, which anything running as your uid can read for the child's whole life, and
+the sealed file would have bought nothing.
+
+So a field named in `--mem-field` is checked for existence but never as a variable name: it may be
+called `PATH`, and nothing is set. A *nickname* on that forbidden list is refused, because a flag
+that appears to name a loader would be read that way by whoever comes next.
+
+A few details that are decisions rather than accidents:
+
+- `${SHELL_VAR}` in an argument is **not** touched, even if a nickname has the same name. Braces
+  with a `$` in front are shell syntax, and this command has no claim on them.
+- `{unknown}` as a whole argument is refused when any slot is declared, because a typo like
+  `{aples}` reaching the child fails as "no such file or directory" — which looks like a broken
+  descriptor rather than a misspelling. Embedded in a longer argument it is left alone, since
+  that shape cannot be told apart from shell syntax.
+- `{…}` tokens are only recognised when the identifier is letters, digits, `_`, starting with a
+  letter or `_`. JSON (`{"a":1}`), brace expansion (`{a,b}`) and empty braces pass through
+  unchanged. With no `--mem-*` flag at all, the argument list after `--` is untouched.
+- `--mem-file` refuses a value spanning lines rather than guessing at quoting, and tells you to
+  use `--mem-field` for that field instead.
+- A colon in a Vault field name is fine: the split is at the **last** colon, because a nickname
+  cannot contain one. `a:b:c` is field `a:b` under nickname `c`.
+
+The bytes stay sealed against writing: the child cannot edit what it was handed, and a run leaves
+no named file anywhere. `kubectl_vault` is the special case of the first flag, kept as its own
+command because it also fixes up kubectl's arguments.
+
+**One caveat, unverified:** whether `podman compose --env-file` accepts a descriptor path is
+untested here, because podman runs outside this environment and the check needs a process holding
+the descriptor open. Everything above is measured; that specific consumer is not. Before relying
+on `--mem-file` with compose, confirm it with:
+
+```console
+$ printf 'FOO=bar\n' > /tmp/e.f; exec 9</tmp/e.f
+$ podman compose -f compose.yaml --env-file /proc/self/fd/9 config
+```
+
 ## Reading the token's own cubbyhole: `vault_cubby`
 
 `vault_cubby` is `vaultenv` pointed at a different place. It takes a cubbyhole path instead of a
@@ -672,6 +741,30 @@ Needs no installs:
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -t tests -v
 ```
+
+The suite must also leave the environment it was started with exactly as it found it: a test
+that mutates `os.environ` and does not restore it changes what every later test sees, and a
+runner's `PGUSER` or `ECMWF_VAULT_ADDR` silently becoming a fixture's value is the kind of
+failure that reports itself as a bug in this package. Run the check with:
+
+```bash
+PYTHONPATH=src:tests python3 - <<'PY'
+import os, unittest
+before = dict(os.environ)
+unittest.TextTestRunner(verbosity=0).run(
+    unittest.TestLoader().discover("tests", top_level_dir="tests"))
+for label, keys in (("removed", set(before) - set(os.environ)),
+                    ("added", set(os.environ) - set(before)),
+                    ("changed", {k for k in before if os.environ.get(k) != before[k]})):
+    print(label, sorted(keys))
+PY
+```
+
+That is a behavioural check because the alternative was tried and abandoned: two static rules
+about which tests may touch `os.environ` were written, reviewed, and removed — whether a guard
+is in force at a given statement depends on what has been entered and not yet exited, which the
+syntax does not record. `tests/test_harness.py` documents both attempts and what remains
+unchecked; the fixture's own restoration is tested there directly.
 
 With a coverage gate (needs `pytest`/`coverage`, which the host does not have).
 Use `run --rm`, not `up`: podman-compose does not propagate the container's exit

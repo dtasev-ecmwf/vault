@@ -93,7 +93,14 @@ def gpg_arguments(*, sealing: bool) -> List[str]:
 
 def run(tool_path: str, gpg_arguments_list: List[str], *, stdin: bytes,
         passphrase: str) -> bytes:
-    """Run gpg, returning its stdout. The passphrase reaches it on a pipe and nowhere else."""
+    """Run gpg, returning its stdout. The passphrase reaches it on a pipe and nowhere else.
+
+    gpg is given no ``--homedir`` and this package creates no directory for it: a read that
+    sealed or unsealed a token was required to leave no file anywhere, and pointing gpg at a
+    fresh home would have made it write one. Honouring ``GNUPGHOME`` is the tool's own
+    documented behaviour, so a host with an unusable ``GNUPGHOME`` gets gpg's error, translated
+    into :data:`TOOL_FAILED_MESSAGE`, rather than a silent workaround.
+    """
     read_fd, write_fd = os.pipe()
     try:
         # Written before the fork: a pipe that size cannot fill, so there is nothing to wait for

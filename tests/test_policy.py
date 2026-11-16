@@ -22,19 +22,16 @@ def swap_file(read_data):
 
 class PolicyTests(unittest.TestCase):
     def setUp(self):
-        self._saved = {
-            name: os.environ.pop(name, None)
-            for name in ("ECMWF_VAULT_SWAP_POLICY", "ECMWF_VAULT_HARDEN")
-        }
+        # patch.dict with clear=True, rather than popping the two names this file cares about
+        # and putting them back by hand. The hand-rolled version had to know which names it
+        # was interested in, so anything else the suite later read from the environment came
+        # from whoever ran the tests; and a by-hand restore is exactly the shape that deletes
+        # a value it did not create.
+        patcher = mock.patch.dict(os.environ, {}, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         _policy._hardened = False
         _policy._warned.clear()
-
-    def tearDown(self):
-        for name, value in self._saved.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
 
     # -- swap detection ---------------------------------------------------
 

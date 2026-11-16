@@ -283,6 +283,10 @@ class FormatTests(unittest.TestCase):
             # Recorded at the moment of the spawn: the patch is undone by the time we can
             # assert, so "there was something to strip" has to be sampled where it is true.
             seen["legacy_in_process_environment"] = "ECMWF_VAULT_TOKEN" in os.environ
+            # Sampled here, at the spawn: this test runs gpg for real, so PATH cannot be set
+            # to a fiction, and comparing against it later would read the runner's value
+            # rather than the one that was in force when the child was built.
+            seen["ambient_path"] = os.environ["PATH"]
             return real(*arguments, **keywords)
 
         # The name has to be present to begin with: an assertion that something is absent from
@@ -293,8 +297,10 @@ class FormatTests(unittest.TestCase):
             sealed.seal(TOKEN)
         self.assertTrue(seen["legacy_in_process_environment"], "nothing was there to strip")
         self.assertIn("env", seen, "gpg was given the environment to inherit")
-        self.assertNotIn("ECMWF_VAULT_TOKEN", seen["env"])
-        self.assertIn("PATH", seen["env"])
+        self.assertFalse("ECMWF_VAULT_TOKEN" in seen["env"],
+                         "the legacy token variable must not reach gpg")
+        self.assertEqual(seen["env"]["PATH"], seen["ambient_path"],
+                         "gpg still inherits everything else it needs")
 
     def test_a_tool_that_floods_stdout_is_stopped(self):
         process = _noisy_process(sealed.MAX_OUTPUT + 10)

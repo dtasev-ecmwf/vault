@@ -63,6 +63,10 @@ def mapping(**fields):
 
 
 class InProcessTests(unittest.TestCase):
+    def setUp(self):
+        # No ambient variable may change what these assert; see _fakes.isolate.
+        _fakes.isolate(self)
+
     """The command's own functions: the read it makes, and what it hands the child."""
 
     def run_cli(self, argv, fields, status=0):
@@ -119,29 +123,37 @@ class InProcessTests(unittest.TestCase):
         _, _, environment = self.run_cli(
             ["--path", CUBBY_PATH, "--field", "DB_USER", "--", "cmd"], mapping(**FIELDS))
         self.assertEqual(environment["DB_USER"], FIELDS["DB_USER"])
-        self.assertNotIn("DB_PASSWORD", environment)
+        self.assertFalse("DB_PASSWORD" in environment,
+                         "DB_PASSWORD must not reach the child environment")
 
     def test_a_renamed_field_arrives_under_the_chosen_name(self):
         _, _, environment = self.run_cli(
             ["--path", CUBBY_PATH, "--set", "SECRET=DB_PASSWORD", "--", "cmd"],
             mapping(**FIELDS))
         self.assertEqual(environment["SECRET"], FIELDS["DB_PASSWORD"])
-        self.assertNotIn("DB_PASSWORD", environment)
+        self.assertFalse("DB_PASSWORD" in environment,
+                         "DB_PASSWORD must not reach the child environment")
 
     def test_the_rest_of_the_environment_is_kept(self):
-        _, _, environment = self.run_cli(["--path", CUBBY_PATH, "--", "cmd"],
-                                         mapping(DB_USER="cems"))
-        self.assertIn("HOME", environment)
-        self.assertIn("PATH", environment)
+        # Pinned values: comparing against what the runner happens to export would make the
+        # assertion mean something different on another host, or fail where one is unset.
+        with mock.patch.dict(os.environ, {"HOME": "/known/home", "PATH": "/known/path"}):
+            _, _, environment = self.run_cli(["--path", CUBBY_PATH, "--", "cmd"],
+                                             mapping(DB_USER="cems"))
+        self.assertEqual(environment["HOME"], "/known/home")
+        self.assertEqual(environment["PATH"], "/known/path")
 
     def test_the_vault_token_is_not_handed_to_the_command(self):
         # The scrub is vaultenv's, and this pins that vault_cubby goes through it rather than
         # through a copy that could drift.
-        with mock.patch.dict(os.environ, {"ECMWF_VAULT_TOKEN": "hvs.a-legacy-export"}):
+        with mock.patch.dict(os.environ, {"ECMWF_VAULT_TOKEN": "hvs.a-legacy-export",
+                                          "HOME": "/known/home"}):
             _, _, environment = self.run_cli(["--path", CUBBY_PATH, "--", "cmd"],
                                              mapping(DB_USER="cems"))
-        self.assertNotIn("ECMWF_VAULT_TOKEN", environment)
-        self.assertIn("HOME", environment)
+        self.assertFalse("ECMWF_VAULT_TOKEN" in environment,
+                         "the legacy token variable must not reach the child")
+        self.assertEqual(environment["HOME"], "/known/home",
+                         "everything else still travels to the child")
 
     def test_the_childs_status_is_returned(self):
         returned, _, _ = self.run_cli(["--path", CUBBY_PATH, "--", "cmd"],

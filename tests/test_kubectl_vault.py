@@ -64,6 +64,10 @@ def mapping(**fields):
 
 
 class InProcessTests(unittest.TestCase):
+    def setUp(self):
+        # No ambient variable may change what these assert; see _fakes.isolate.
+        _fakes.isolate(self)
+
     """The command's own functions: field choice, the environment, and launching."""
 
     def run_cli(self, argv, fields=None, status=0):
@@ -107,10 +111,13 @@ class InProcessTests(unittest.TestCase):
     def test_kubectl_does_not_inherit_the_vault_token(self):
         # Set by hand, not by the fixture: nothing here reads that name, and the point is that a
         # stale export from an older copy of this package is not passed on to the child.
-        with mock.patch.dict(os.environ, {"ECMWF_VAULT_TOKEN": "hvs.a-legacy-export"}):
+        with mock.patch.dict(os.environ, {"ECMWF_VAULT_TOKEN": "hvs.a-legacy-export",
+                                          "HOME": "/known/home"}):
             _, call = self.run_cli(["--secret", "p", "--", "version"])
-        self.assertNotIn("ECMWF_VAULT_TOKEN", call.kwargs["env"])
-        self.assertIn("HOME", call.kwargs["env"])
+        self.assertFalse("ECMWF_VAULT_TOKEN" in call.kwargs["env"],
+                         "the legacy token variable must not reach kubectl")
+        self.assertEqual(call.kwargs["env"]["HOME"], "/known/home",
+                         "everything else still travels to kubectl")
 
     def test_the_command_arguments_are_appended_in_order(self):
         # The shape the user actually types: flags before the verb, no "--".

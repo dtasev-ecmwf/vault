@@ -269,7 +269,11 @@ class TransportTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("SSLKEYLOGFILE", None)
             _transport.create_context(self.fake.ca_bundle)
-            self.assertNotIn("SSLKEYLOGFILE", os.environ)
+            # assertFalse with a message rather than assertNotIn: the latter renders its
+            # container on failure, and this container is this process's real environment,
+            # with whatever credentials the runner happens to hold.
+            self.assertFalse("SSLKEYLOGFILE" in os.environ,
+                             "create_context must not add SSLKEYLOGFILE")
 
     def test_the_context_is_never_weaker_than_the_platform_default(self):
         with mock.patch.dict(os.environ, {}, clear=False):

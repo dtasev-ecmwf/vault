@@ -37,6 +37,7 @@ SOURCE = os.path.join(REPOSITORY, "src")
 SECRET_PATH = "user_applications_and_services_team/cems_web/db"
 TOKEN = "synthetic-vault-token"
 FIELDS = {"PGHOST": "db.example.int", "PGUSER": "cems", "PGPASSWORD": "SYNTHETIC-PW"}
+KUBE_TEXT = "apiVersion: v1\nkind: Config\n"
 ENTRY_POINT = "ecmwf_vault.commands.vaultenv:main"
 
 # Written out here rather than read from the module. A test that iterates the
@@ -86,6 +87,10 @@ class Recording:
 
 
 class InProcessTests(unittest.TestCase):
+    def setUp(self):
+        # No ambient variable may change what these assert; see _fakes.isolate.
+        _fakes.isolate(self)
+
     """The command's own functions: mapping, refusals, and the environment it builds."""
 
     def run_cli(self, argv, fields, status=0):
@@ -120,20 +125,27 @@ class InProcessTests(unittest.TestCase):
             self.assertEqual(environment[name], text)
 
     def test_the_rest_of_the_environment_is_kept(self):
-        with _fakes.vault_environment():
+        # The compared values are pinned, not read from the runner: HOME and PATH are what the
+        # test says they are, so the assertion cannot change meaning on another host, and
+        # cannot fail because the suite was started with one of them unset.
+        with _fakes.vault_environment(), mock.patch.dict(
+                os.environ, {"HOME": "/known/home", "PATH": "/known/path"}):
             _, _, environment = self.run_cli(
                 ["--secret", "p", "--", "cmd"], mapping(PGUSER="cems"))
-        self.assertIn("HOME", environment)
-        self.assertIn("PATH", environment)
+        self.assertEqual(environment["HOME"], "/known/home")
+        self.assertEqual(environment["PATH"], "/known/path")
 
     def test_the_vault_token_is_not_handed_to_the_command(self):
-        # Set by hand, not by the fixture: nothing here reads that name, and the point is that a
-        # stale export from an older copy of this package does not travel into the child.
-        with mock.patch.dict(os.environ, {"ECMWF_VAULT_TOKEN": "hvs.a-legacy-export"}):
+        # Set by hand, not by the fixture: nothing here reads that name, and the point is that
+        # a stale export from an older copy of this package does not travel into the child.
+        with mock.patch.dict(os.environ, {"ECMWF_VAULT_TOKEN": "hvs.a-legacy-export",
+                                          "HOME": "/known/home"}):
             _, _, environment = self.run_cli(
                 ["--secret", "p", "--", "cmd"], mapping(PGUSER="cems"))
-        self.assertNotIn("ECMWF_VAULT_TOKEN", environment)
-        self.assertIn("HOME", environment)
+        self.assertFalse("ECMWF_VAULT_TOKEN" in environment,
+                         "the legacy token variable must not reach the child")
+        self.assertEqual(environment["HOME"], "/known/home",
+                         "everything else still travels to the child")
 
     def test_each_value_is_revealed_exactly_once(self):
         fields = {"PGUSER": Recording("cems"), "PGPASSWORD": Recording("pw")}
@@ -164,7 +176,8 @@ class InProcessTests(unittest.TestCase):
                 ["--secret", "p", "--set", "DBUSER=PGUSER", "--", "cmd"],
                 mapping(PGUSER="cems", PGPASSWORD="pw"))
         self.assertEqual(environment["DBUSER"], "cems")
-        self.assertNotIn("PGPASSWORD", environment)
+        self.assertFalse("PGPASSWORD" in environment,
+                         "PGPASSWORD must not reach the child environment")
 
     def test_field_selects_one_field_under_its_own_name(self):
         with _fakes.vault_environment():
@@ -172,7 +185,8 @@ class InProcessTests(unittest.TestCase):
                 ["--secret", "p", "--field", "PGUSER", "--", "cmd"],
                 mapping(PGUSER="cems", PGPASSWORD="pw"))
         self.assertEqual(environment["PGUSER"], "cems")
-        self.assertNotIn("PGPASSWORD", environment)
+        self.assertFalse("PGPASSWORD" in environment,
+                         "PGPASSWORD must not reach the child environment")
 
     def test_field_is_repeatable(self):
         with _fakes.vault_environment():
@@ -181,7 +195,8 @@ class InProcessTests(unittest.TestCase):
                 mapping(PGUSER="cems", PGHOST="db", PGPASSWORD="pw"))
         self.assertEqual(environment["PGUSER"], "cems")
         self.assertEqual(environment["PGHOST"], "db")
-        self.assertNotIn("PGPASSWORD", environment)
+        self.assertFalse("PGPASSWORD" in environment,
+                         "PGPASSWORD must not reach the child environment")
 
     def test_field_and_set_together_are_the_union(self):
         with _fakes.vault_environment():
@@ -190,7 +205,8 @@ class InProcessTests(unittest.TestCase):
                 mapping(PGUSER="cems", PGHOST="db", PGPASSWORD="pw"))
         self.assertEqual(environment["PGUSER"], "cems")
         self.assertEqual(environment["DB"], "db")
-        self.assertNotIn("PGPASSWORD", environment)
+        self.assertFalse("PGPASSWORD" in environment,
+                         "PGPASSWORD must not reach the child environment")
 
     def test_field_naming_a_missing_field_lists_what_is_there(self):
         message = self.refusal(["--secret", "p", "--field", "nope", "--", "cmd"],
@@ -446,6 +462,324 @@ class InProcessTests(unittest.TestCase):
                 self.assertEqual(cli.main(), 7)
 
 
+class MemoryFileTests(unittest.TestCase):
+    def setUp(self):
+        # No ambient variable may change what these assert; see _fakes.isolate.
+        _fakes.isolate(self)
+
+    """``--mem-file`` and ``--mem-field``: the selection rules and what reaches the child."""
+
+    def run_cli(self, argv, fields, status=0):
+        """Run ``run()`` and report the spawn call, or None if the child never ran."""
+        with mock.patch.object(cli, "value", return_value=fields), \
+                mock.patch.object(contract, "subprocess") as child:
+            child.call.return_value = status
+            returned = cli.run(argv)
+            call = child.call.call_args if child.call.called else None
+        return returned, call
+
+    def refusal(self, argv, fields):
+        with mock.patch.object(cli, "value", return_value=fields):
+            with self.assertRaises(SystemExit) as caught:
+                cli.run(argv)
+        self.assertIsInstance(caught.exception.code, str)
+        return str(caught.exception.code)
+
+    # -- what the child receives -----------------------------------------
+
+    def test_a_memory_field_is_not_also_a_variable(self):
+        # The whole point of the descriptor. Exported as well, anything sharing this uid could
+        # read it in /proc/<pid>/environ for the child's whole life, and the sealed file would
+        # have bought nothing.
+        _, call = self.run_cli(
+            ["--secret", "p", "--field", "PGUSER", "--mem-field=PGPASSWORD:pw", "--", "cmd"],
+            mapping(**FIELDS))
+        self.assertEqual(call.kwargs["env"]["PGUSER"], FIELDS["PGUSER"])
+        self.assertFalse("PGPASSWORD" in call.kwargs["env"],
+                         "PGPASSWORD must not reach the child environment")
+
+    def test_the_descriptor_is_the_only_extra_thing_inherited(self):
+        _, call = self.run_cli(["--secret", "p", "--mem-field=PGPASSWORD:pw", "--",
+                                "cmd", "{pw}"], mapping(**FIELDS))
+        descriptors = call.kwargs["pass_fds"]
+        self.assertEqual(len(descriptors), 1)
+        # The number in argv is the number handed over, or /proc/self/fd/<n> names nothing.
+        self.assertEqual(call.args[0][1], "/proc/self/fd/%d" % descriptors[0])
+
+    def test_a_nickname_is_replaced_wherever_it_appears(self):
+        _, call = self.run_cli(
+            ["--secret", "p", "--mem-field=PGPASSWORD:pw", "--", "tool",
+             "--password-file={pw}", "{pw}"], mapping(**FIELDS))
+        glued, whole = call.args[0][1], call.args[0][2]
+        path = glued.split("=", 1)[1]
+        self.assertTrue(path.startswith("/proc/self/fd/"))
+        self.assertEqual(whole, path, "the same nickname resolves the same way both places")
+
+    def test_a_whole_mem_file_leaves_the_environment_untouched(self):
+        with mock.patch.dict(os.environ, {"HOME": "/known/home"}):
+            _, call = self.run_cli(
+                ["--secret", "p", "--field", "PGUSER", "--field", "PGPASSWORD",
+                 "--mem-file=potatoes", "--", "cmd"], mapping(**FIELDS))
+        for name in ("PGUSER", "PGPASSWORD"):
+            self.assertFalse(name in call.kwargs["env"],
+                             "%s must not reach the child environment" % (name,))
+        self.assertEqual(call.kwargs["env"]["HOME"], "/known/home",
+                         "the rest of the environment is kept")
+
+    def test_the_mem_file_contents_are_the_serialised_selection(self):
+        # Read *while the child runs*: run() closes every slot on the way out, so a descriptor
+        # inspected afterwards is gone. That closing is the tested property, not an obstacle.
+        seen = {}
+
+        def spy(command, **keywords):
+            descriptor, = keywords["pass_fds"]
+            with open("/proc/self/fd/%d" % descriptor, "rb") as handle:
+                seen["body"] = handle.read()
+            seen["env_has"] = [name for name in ("PGUSER", "PGPASSWORD")
+                               if name in keywords["env"]]
+            return 0
+
+        with mock.patch.object(cli, "value", return_value=mapping(PGUSER="cems",
+                                                                 PGPASSWORD="SYNTHETIC-PW")), \
+                mock.patch.object(contract, "subprocess") as child:
+            child.call.side_effect = spy
+            cli.run(["--secret", "p", "--field", "PGUSER", "--field", "PGPASSWORD",
+                     "--mem-file=potatoes", "--", "cmd"])
+        self.assertEqual(seen["body"], b"PGPASSWORD=SYNTHETIC-PW\nPGUSER=cems\n")
+        self.assertEqual(seen["env_has"], [])
+
+    def test_the_slot_is_closed_once_the_command_returns(self):
+        # Our end must not outlive the child: the file is anonymous, but a leaked descriptor is
+        # still a handle on plaintext for the life of the process.
+        kept = []
+
+        def spy(command, **keywords):
+            kept.append(keywords["pass_fds"][0])
+            return 0
+
+        with mock.patch.object(cli, "value", return_value=mapping(**FIELDS)), \
+                mock.patch.object(contract, "subprocess") as child:
+            child.call.side_effect = spy
+            cli.run(["--secret", "p", "--mem-field=PGPASSWORD:pw", "--", "cmd"])
+        self.assertEqual(len(kept), 1)
+        with self.assertRaises(OSError):
+            os.fstat(kept[0])
+
+    def test_a_secret_whose_only_field_is_held_in_a_descriptor_needs_no_variables(self):
+        # The default mapping would refuse "kube-config" as a name. Nothing becomes a name
+        # here.
+        _, call = self.run_cli(["--secret", "p", "--mem-field=kube-config:kube", "--", "cmd"],
+                               mapping(**{"kube-config": KUBE_TEXT}))
+        self.assertFalse("kube-config" in call.kwargs["env"],
+                         "the descriptor field must not be exported either")
+
+    # -- refusals ---------------------------------------------------------
+
+    def test_a_field_cannot_be_both_a_variable_and_a_descriptor(self):
+        message = self.refusal(
+            ["--secret", "p", "--field", "PGPASSWORD", "--mem-field=PGPASSWORD:pw",
+             "--", "cmd"], mapping(**FIELDS))
+        self.assertIn("asked for twice", message)
+        self.assertIn("PGPASSWORD", message)
+
+    def test_a_renamed_field_cannot_also_be_a_descriptor(self):
+        message = self.refusal(
+            ["--secret", "p", "--set", "SECRET=PGPASSWORD", "--mem-field=PGPASSWORD:pw",
+             "--", "cmd"], mapping(**FIELDS))
+        self.assertIn("asked for twice", message)
+
+    def test_mem_file_refuses_a_value_spanning_lines(self):
+        message = self.refusal(
+            ["--secret", "p", "--field", "PGPASSWORD", "--mem-file=potatoes", "--", "cmd"],
+            mapping(PGPASSWORD="line\nbreak"))
+        self.assertIn("spanning lines", message)
+        self.assertIn("--mem-field", message, "and it says what to do instead")
+        self.assertNotIn("line\nbreak", message.replace("\\n", "<value>"))
+
+    def test_a_forbidden_name_is_refused_as_a_nickname_too(self):
+        for nickname in ("LD_PRELOAD", "PATH", "PYTHONPATH"):
+            with self.subTest(nickname=nickname):
+                message = self.refusal(
+                    ["--secret", "p", "--field", "PGUSER", "--mem-file=" + nickname,
+                     "--", "cmd"], mapping(**FIELDS))
+                self.assertIn(nickname, message)
+
+    def test_a_forbidden_field_name_still_reaches_a_descriptor(self):
+        # The nickname is checked; a *field* named like a forbidden variable may legitimately
+        # be handed over as bytes, because nothing about it becomes a variable name.
+        #
+        # The inherited PATH is pinned rather than read: with the valid setting PATH=/usr/bin
+        # an assertion written as "not equal to /usr/bin" fails while the behaviour is correct.
+        # The field's value is deliberately different from the sentinel, so an overwrite would
+        # be visible.
+        with mock.patch.dict(os.environ, {"PATH": "/known/sentinel/bin"}):
+            _, call = self.run_cli(["--secret", "p", "--mem-field=PATH:pathy", "--", "cmd"],
+                                   mapping(PATH="/usr/bin"))
+        self.assertEqual(call.kwargs["env"]["PATH"], "/known/sentinel/bin",
+                         "the inherited PATH survived; the field never became a variable")
+
+    def test_a_malformed_mem_field_is_refused(self):
+        for item in ("nocolon", ":noname", "nofield:"):
+            with self.subTest(item=item):
+                message = self.refusal(
+                    ["--secret", "p", "--mem-field=" + item, "--", "cmd"], mapping(**FIELDS))
+                self.assertIn("--mem-field takes NAME:NICKNAME", message)
+
+    def test_an_unknown_field_in_a_mem_field_lists_what_exists(self):
+        message = self.refusal(["--secret", "p", "--mem-field=nope:pw", "--", "cmd"],
+                               mapping(**FIELDS))
+        self.assertIn("no field 'nope'", message)
+        self.assertIn("PGUSER", message)
+
+    def test_two_slots_cannot_share_a_nickname(self):
+        message = self.refusal(
+            ["--secret", "p", "--mem-field=PGUSER:x", "--mem-field=PGPASSWORD:x", "--", "cmd"],
+            mapping(**FIELDS))
+        self.assertIn("two memory files named 'x'", message)
+
+    def test_a_nickname_that_is_not_an_identifier_is_refused(self):
+        message = self.refusal(
+            ["--secret", "p", "--mem-field=PGUSER:2bad", "--", "cmd"], mapping(**FIELDS))
+        self.assertIn("not usable as a memory-file name", message)
+
+    def test_an_empty_mem_file_is_refused_rather_than_ignored(self):
+        # ``--mem-file=`` was *given*. Reading it as absent exports the secret into the
+        # environment with an exit status of 0 and no descriptor at all — the weaker behaviour,
+        # chosen silently by a typo. So: refuse, do not spawn, do not export.
+        for item in ("", "  "):
+            with self.subTest(mem_file=repr(item)):
+                with mock.patch.object(cli, "value", return_value=mapping(**FIELDS)), \
+                        mock.patch.object(contract, "subprocess") as child:
+                    argv = ["--secret", "p", "--field", "PGPASSWORD",
+                            "--mem-file=" + item, "--", "cmd"]
+                    with self.assertRaises(SystemExit) as caught:
+                        cli.run(argv)
+                    self.assertIsInstance(caught.exception.code, str)
+                    self.assertIn("not usable as a memory-file name", caught.exception.code)
+                    child.call.assert_not_called()
+                    exported = [call.kwargs.get("env", {})
+                                for call in child.call.call_args_list]
+                    self.assertEqual(exported, [], "no child ran, so nothing was exported")
+
+    def test_an_empty_mem_field_is_refused_rather_than_ignored(self):
+        for item in ("", ":", "a:", ":b"):
+            with self.subTest(item=repr(item)):
+                message = self.refusal(
+                    ["--secret", "p", "--mem-field=" + item, "--", "cmd"], mapping(**FIELDS))
+                self.assertIn("--mem-field takes NAME:NICKNAME", message)
+
+    def test_a_value_the_environment_could_carry_is_not_refused_by_a_descriptor(self):
+        # A lone surrogate in the U+DC80-U+DCFF range is os.fsencode's way of carrying a byte
+        # that was never valid UTF-8, so --field exports it today. Both descriptor flags must
+        # accept the same value and produce the same bytes; refusing, or raising
+        # UnicodeEncodeError (whose repr() holds the secret), is the bug.
+        for flag, expected in (("--mem-field=PGPASSWORD:pw", b"hunter\x802"),
+                               ("--mem-file=potatoes", b"PGPASSWORD=hunter\x802\n")):
+            with self.subTest(flag=flag):
+                fields = {"PGPASSWORD": Secret("hunter\udc802")}
+                seen = {}
+
+                def spy(command, **keywords):
+                    descriptor, = keywords["pass_fds"]
+                    with open("/proc/self/fd/%d" % descriptor, "rb") as handle:
+                        seen["bytes"] = handle.read()
+                    return 0
+
+                # No --field: naming a field both as a variable and as a descriptor is a
+                # refusal in its own right, tested elsewhere.
+                argv = ["--secret", "p", flag, "--", "cmd"]
+                with mock.patch.object(cli, "value", return_value=fields), \
+                        mock.patch.object(contract, "subprocess") as child:
+                    child.call.side_effect = spy
+                    self.assertEqual(cli.run(argv), 0)
+                self.assertEqual(seen["bytes"], expected)
+
+    def test_a_clash_does_not_refuse_a_selection_that_goes_to_a_descriptor(self):
+        # Nothing named by --mem-file reaches the environment, so an inherited name is not
+        # being overwritten and the command must run.
+        with mock.patch.dict(os.environ, {"PGUSER": "already-set"}), \
+                mock.patch.object(cli, "value", return_value=mapping(**FIELDS)), \
+                mock.patch.object(contract, "subprocess") as child:
+            child.call.return_value = 0
+            status = cli.run(["--secret", "p", "--field", "PGUSER", "--field", "PGPASSWORD",
+                              "--mem-file=potatoes", "--", "cmd"])
+        self.assertEqual(status, 0)
+        env = child.call.call_args.kwargs["env"]
+        self.assertEqual(env["PGUSER"], "already-set", "the inherited value survived")
+        self.assertFalse("PGPASSWORD" in env, "PGPASSWORD must not be exported")
+
+    def test_a_clash_still_refuses_when_the_value_is_actually_exported(self):
+        # The converse, so the skip above is not simply the check being gone.
+        with mock.patch.dict(os.environ, {"PGUSER": "already-set"}):
+            message = self.refusal(
+                ["--secret", "p", "--field", "PGUSER", "--", "cmd"], mapping(**FIELDS))
+        self.assertIn("already set", message)
+
+    def test_a_clash_still_refuses_for_a_mem_field_alongside_exported_values(self):
+        # --mem-field leaves some fields in the environment; those keep the clash check.
+        with mock.patch.dict(os.environ, {"PGHOST": "db.internal"}):
+            message = self.refusal(
+                ["--secret", "p", "--field", "PGHOST", "--mem-field=PGPASSWORD:pw",
+                 "--", "cmd"], mapping(**FIELDS))
+        self.assertIn("already set", message)
+
+    def test_a_memory_field_holds_to_the_same_value_rules_as_a_variable(self):
+        # Not a parallel implementation of the checks: --mem-field goes through the same
+        # variable_values, so a structure, a NUL or a lone surrogate is refused the same way.
+        # Stated per case, because a mutation that reads the field directly would crash here
+        # with an AttributeError instead of refusing, and nothing else in this file notices.
+        for value, expected in (({"a": 1}, "holds dict"), (["x"], "holds list"),
+                                ("nul\u0000inside", "NUL byte"),
+                                ("before\ud800after", "lone surrogate")):
+            with self.subTest(value=type(value).__name__ or repr(value)):
+                message = self.refusal(
+                    ["--secret", "p", "--mem-field=PGPASSWORD:pw", "--", "cmd"],
+                    {"PGPASSWORD": Secret(value)})
+                self.assertIn(expected, message)
+                self.assertNotIn("Traceback", message)
+
+    def test_the_descriptor_is_closed_even_when_the_command_raises(self):
+        # Distinguishes the explicit close from one that merely happens when the frame is
+        # collected: an in-flight exception keeps run()'s locals alive, so a slot released only
+        # by garbage collection would still be open here.
+        kept = []
+
+        def spy(command, **keywords):
+            kept.append(keywords["pass_fds"][0])
+            raise RuntimeError("the child could not be started")
+
+        with mock.patch.object(cli, "value", return_value=mapping(**FIELDS)), \
+                mock.patch.object(contract, "subprocess") as child:
+            child.call.side_effect = spy
+            raised = None
+            try:
+                cli.run(["--secret", "p", "--mem-field=PGPASSWORD:pw", "--", "cmd"])
+            except RuntimeError as error:
+                raised = error
+        self.assertIsNotNone(raised, "the failure was swallowed")
+        # Held on purpose: an exception keeps the frames in its traceback alive, and with them
+        # every local in run(), including the slots. If the close were left to garbage
+        # collection this descriptor would still be open right now.
+        self.assertIsNotNone(raised.__traceback__)
+        self.assertEqual(len(kept), 1)
+        with self.assertRaises(OSError):
+            os.fstat(kept[0])
+
+    # -- parsing ----------------------------------------------------------
+
+    def test_the_split_is_from_the_last_colon(self):
+        # Vault field names may contain colons; nicknames may not, so the tail decides.
+        self.assertEqual(cli.split_mem_field("a:b:c"), ("a:b", "c"))
+        self.assertEqual(cli.split_mem_field("kube:kube"), ("kube", "kube"))
+
+    def test_no_mem_flags_means_the_command_is_untouched(self):
+        # The pass-through promise, restated for the feature that could have broken it.
+        _, call = self.run_cli(["--secret", "p", "--field", "PGUSER", "--",
+                                "cmd", "{braces}", "${HOME}"], mapping(**FIELDS))
+        self.assertEqual(call.args[0], ["cmd", "{braces}", "${HOME}"])
+        self.assertNotIn("pass_fds", call.kwargs)
+
+
 class BlackBoxTests(unittest.TestCase):
     """The real thing: a subprocess command, a loopback Vault, a real environment."""
 
@@ -658,6 +992,84 @@ sys.exit(int(os.environ.get("STAND_IN_EXIT", "0")))
         self.assertNotIn("ARGV", result.stdout)
 
     # -- the installed command -------------------------------------------
+
+    def test_a_real_child_opens_the_descriptor_and_sees_no_variable(self):
+        # The claim the in-process tests cannot make: that the number survives exec, and that
+        # the child's own /proc/self/fd/<n> really is the sealed bytes. Everything else here is
+        # about what was put in argv, which is a different fact.
+        self.fake.fields = {"kubeconfig": KUBE_TEXT, "PGUSER": "cems"}
+        # os.write, not a buffered file object: ``f.write(...)`` on a sealed memfd succeeds
+        # into the buffer and only fails at close, so a probe that never closes reports a
+        # writable file that is in fact sealed. Verified separately: the syscall returns EPERM
+        # and the bytes are unchanged.
+        reader = (
+            "import os, sys\n"
+            "path = sys.argv[1]\n"
+            "print('FD ' + path)\n"
+            "print('BODY ' + open(path).read().strip())\n"
+            "descriptor = os.open(path, os.O_WRONLY)\n"
+            "try:\n"
+            "    os.write(descriptor, b'appended')\n"
+            "    print('WRITABLE True')\n"
+            "except OSError as error:\n"
+            "    print('WRITABLE False ' + type(error).__name__)\n"
+            "finally:\n"
+            "    os.close(descriptor)\n"
+            "print('VAR ' + repr(os.environ.get('kubeconfig')))\n")
+        result = self.run_cli("--secret", SECRET_PATH, "--mem-field=kubeconfig:kube",
+                              "--", sys.executable, "-c", reader, "{kube}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = dict(line.split(" ", 1) for line in result.stdout.splitlines())
+        self.assertTrue(lines["FD"].startswith("/proc/self/fd/"), lines["FD"])
+        self.assertEqual(lines["BODY"], "apiVersion: v1")
+        self.assertEqual(lines["VAR"], "None", "the field is not in the child's environment")
+        # lines["WRITABLE"] is the value after the key was split off, so it reads
+        # "False PermissionError".
+        self.assertTrue(lines["WRITABLE"].startswith("False"),
+                        "sealed: the child cannot edit what it was handed -> "
+                        + lines["WRITABLE"])
+
+    def test_a_real_child_reads_the_serialised_environment_file(self):
+        self.fake.fields = {"PGUSER": "cems", "PGPASSWORD": "SYNTHETIC-PW"}
+        reader = ("import os,sys;"
+                  "print('BODY ' + open(sys.argv[1]).read().replace(chr(10), '|'));"
+                  "print('PGUSER ' + repr(os.environ.get('PGUSER')))")
+        result = self.run_cli("--secret", SECRET_PATH, "--field", "PGUSER",
+                              "--field", "PGPASSWORD", "--mem-file=potatoes",
+                              "--", sys.executable, "-c", reader, "{potatoes}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = dict(line.split(" ", 1) for line in result.stdout.splitlines())
+        self.assertEqual(lines["BODY"], "PGPASSWORD=SYNTHETIC-PW|PGUSER=cems|")
+        self.assertEqual(lines["PGUSER"], "None")
+
+    def test_two_nicks_reach_the_same_child_as_distinct_files(self):
+        # If the numbers collided, or one slot were closed early, the child would read the
+        # wrong secret rather than report anything useful.
+        self.fake.fields = {"a": "first", "b": "second"}
+        reader = ("import sys;"
+                  "print('A ' + open(sys.argv[1]).read());"
+                  "print('B ' + open(sys.argv[2]).read())")
+        result = self.run_cli("--secret", SECRET_PATH, "--mem-field=a:one",
+                              "--mem-field=b:two", "--", sys.executable, "-c", reader,
+                              "{one}", "{two}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("A first", result.stdout)
+        self.assertIn("B second", result.stdout)
+
+    def test_a_descriptor_run_writes_nothing_to_disk(self):
+        self.fake.fields = {"PGPASSWORD": "SYNTHETIC-PW"}
+        before = sorted(os.listdir(self.scratch))
+        result = self.run_cli("--secret", SECRET_PATH, "--mem-field=PGPASSWORD:pw", "--",
+                              sys.executable, "-c", "import sys; open(sys.argv[1]).read()",
+                              "{pw}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sorted(os.listdir(self.scratch)), before)
+        for root in (self.scratch, self.home):
+            for directory, _, names in os.walk(root):
+                for name in names:
+                    with open(os.path.join(directory, name), "rb") as handle:
+                        self.assertNotIn(b"SYNTHETIC-PW", handle.read(),
+                                         os.path.join(directory, name))
 
     def test_pyproject_declares_the_console_script_and_it_resolves(self):
         # What makes this a command on PATH rather than a script in examples/.

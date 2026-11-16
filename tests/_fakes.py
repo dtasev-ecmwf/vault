@@ -144,9 +144,7 @@ def write_sealed_token_file(token: str = SEALED_TOKEN, mode: int = 0o600,
     already sealed is read without the library having to seal it first, so those tests do not
     turn into tests of the sealing path by accident.
     """
-    from ecmwf_vault import _sealed_token_file
-    return write_bytes(_sealed_token_file.seal(token), mode=mode, directory=directory,
-                       name=name)
+    return write_bytes(seal_isolated(token), mode=mode, directory=directory, name=name)
 
 
 import _loopback_guard
@@ -155,6 +153,25 @@ import _loopback_guard
 # connection off loopback. See its docstring for why that is worth enforcing.
 _loopback_guard.install_socket_guard()
 
+# Everything the isolated environment starts with, apart from what a test passes explicitly.
+#
+# This is an ALLOW list, deliberately. The alternative was a list of names to remove, and that
+# failed twice over: the suite's fake field names are whatever a test invents (PGUSER today,
+# PGOPTIONS tomorrow), so any denylist is complete only until the next test is written, and a
+# name missing from it makes a correct command look like it clashed with something the runner
+# exported. Starting from nothing means a test cannot inherit an input it never asked for.
+BASE_ENVIRONMENT = ("PATH", "HOME")
+
+# Names a test may pretend the runner exported, to prove none of them leak in. Nothing here
+# depends on the list being complete: the fixture clears everything, so an unlisted name is
+# excluded for the same reason the listed ones are.
+ISOLATION_PROBE_NAMES = (
+    "PGOPTIONS", "PGUSER", "PGPASSWORD", "DB_USER", "DB_PASSWORD",
+    "AWS_SECRET_ACCESS_KEY", "SOME_FIELD_A_TEST_MIGHT_INVENT",
+    "ECMWF_VAULT_ADDR", "ECMWF_VAULT_TOKEN",
+)
+
+# The package's own settings, which a test must never pick up from the machine running it.
 VAULT_VARIABLES = (
     "ECMWF_VAULT_TOKEN_FILE", "ECMWF_VAULT_ADDR", "ECMWF_VAULT_MOUNT",
     "ECMWF_VAULT_CA_BUNDLE", "ECMWF_VAULT_TIMEOUT", "ECMWF_VAULT_SWAP_POLICY",
@@ -164,6 +181,21 @@ VAULT_VARIABLES = (
 # Test fixtures only, and named for what it is: the KEY is the plaintext token and the value is
 # its cipher, so this is a gpg-avoidance cache and not a secure store of anything.
 _sealed_cache: Dict[str, bytes] = {}
+
+
+def seal_isolated(token: str) -> bytes:
+    """Seal a token with the host's gnupg configuration removed from the environment.
+
+    ``GNUPGHOME`` is gpg's own setting and the product deliberately does not override it,
+    so sealing inherits it. In a fixture that is wrong twice over: token creation fails on
+    a host whose ``GNUPGHOME`` points somewhere unusable, and whatever that machine has
+    configured changes what the test is handed. Clearing it here keeps the product
+    behaviour under test and makes the fixture mean the same thing everywhere.
+    """
+    from ecmwf_vault import _sealed_token_file
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("GNUPGHOME", None)
+        return _sealed_token_file.seal(token)
 
 
 def token_file(token: str) -> str:
@@ -176,8 +208,7 @@ def token_file(token: str) -> str:
     """
     payload = _sealed_cache.get(token)
     if payload is None:
-        from ecmwf_vault import _sealed_token_file
-        payload = _sealed_token_file.seal(token)
+        payload = seal_isolated(token)
         _sealed_cache[token] = payload
     directory = tempfile.mkdtemp(prefix="ecmwf-vault-token-home-")
     atexit.register(shutil.rmtree, directory, True)
@@ -201,14 +232,23 @@ def vault_environment(**overrides: Any):
     it, there is no token anywhere.
     """
     token = overrides.pop("token", None)
-    settings: Dict[str, Any] = {"HOME": absent_home()}
+    # HOME is pinned to a directory that always exists, so the default token file cannot be
+    # found. PATH is passed through unchanged: tests run gpg, kubectl and interpreters for
+    # real, and os.defpath does not include /usr/local/bin, where gpg commonly lives.
+    settings: Dict[str, Any] = {name: os.environ[name] for name in BASE_ENVIRONMENT
+                                if name in os.environ}
+    settings["HOME"] = absent_home()
     settings.update(overrides)
-    if token is not None:
-        settings["ECMWF_VAULT_TOKEN_FILE"] = token_file(token)
-    with mock.patch.dict(os.environ, settings):
-        for name in VAULT_VARIABLES:
-            if name not in settings:
-                os.environ.pop(name, None)
+    # clear=True: during a test the environment is exactly BASE_ENVIRONMENT plus what that
+    # test asked for. Nothing needs removing any more, which is the point — VAULT_VARIABLES
+    # survives only as documentation of what a caller must pass explicitly to be honoured.
+    with mock.patch.dict(os.environ, settings, clear=True):
+        if token is not None:
+            # Built *inside* the isolation. Sealing runs gpg, and gpg reads GNUPGHOME,
+            # trust-home and agent settings from the environment: doing this first meant a
+            # hostile or unusable setting on the host could break fixture setup before a
+            # single assertion ran.
+            os.environ["ECMWF_VAULT_TOKEN_FILE"] = token_file(token)
         yield
 
 
@@ -388,6 +428,20 @@ class FakeVault:
         self._httpd.shutdown()
         self._httpd.server_close()
         self._thread.join(timeout=5)
+
+
+def isolate(test: Any, **overrides: Any) -> None:
+    """Remove every variable this package and its tests read, for one test.
+
+    In-process tests call the command functions directly, so an ambient ``PGUSER`` or a
+    stale ``ECMWF_VAULT_*`` export reaches the code under test and changes what an
+    assertion means: a clash refusal triggered by the runner is a failure the package did
+    not cause. Registering the context manager through ``addCleanup`` keeps teardown
+    ordered with the test's own.
+    """
+    environment = vault_environment(**overrides)
+    environment.__enter__()
+    test.addCleanup(environment.__exit__, None, None, None)
 
 
 def make_vault(fake: FakeVault, **overrides: Any) -> Any:
