@@ -4,11 +4,31 @@
 
 Read secrets from [ECMWF Vault](https://secrets.ecmwf.int/) without writing them to disk. The package provides a Python API and commands for passing secrets to other programs.
 
+This package interacts with the Vault's public facing API. It tries to do as little as possible.
+
+Some commands can get verbose. I suggest: use aliases, abbreviations or LLMs -> this package is well parsed by LLMs
+and can trivialise more complicated or verbose vaultenv commands. It also provides an additional layer of protection
+against LLM divergence from prompts. They can no longer stray into a Kubeconfig if it so happens to be available alongside
+
+This repository is scheduled to be transferred into the ecmwf org.
+
 ## Install and sign in
 
-Requires Linux, CPython 3.9 or later with `memfd_create` and file sealing support, and `gpg` or `gpg2` on `PATH`. Use a distribution Python if your Conda interpreter lacks file sealing support. There are no Python runtime dependencies. Install `kubectl` separately if you use `kubectl_vault`.
+Requires Linux, CPython 3.9 or later with `memfd_create` and file sealing support, and `gpg` or `gpg2` on `PATH`. Use a distribution Python if your Conda interpreter lacks file sealing support. There are **no Python runtime dependencies**. Install `kubectl` separately if you use `kubectl_vault`.
 
-From the repository root in a venv:
+On the VDI:
+- note this requires `/home/madt/.local/bin/` on your PATH
+
+```bash
+/usr/bin/python3.9 -m pip install "git+https://github.com/dtasev-ecmwf/vault.git@main"
+```
+
+To uninstall from VDI:
+```bash
+/usr/bin/python3.9 -m pip uninstall ecmwf-vault
+```
+
+You can also clone the code locally and then install in a venv from the repository root:
 
 ```bash
 python3 -m venv .venv
@@ -16,17 +36,14 @@ source .venv/bin/activate
 python -m pip install .
 ```
 
-On the VDI:
-- note this requires `/home/madt/.local/bin/` on your PATH
+Or you could install directly from Github into venv:
 
 ```bash
-python3.9 -m pip install --user .
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install "git+https://github.com/dtasev-ecmwf/vault.git@main"
 ```
 
-To uninstall from VDI:
-```bash
-/usr/bin/python3.9 -m pip uninstall ecmwf-vault
-```
 
 1. Run `vault_login` in a terminal and paste the token at the prompt. The command does not echo the token. It validates it, saves it encrypted, and reports its expiry.
 1.1. Sign in at [secrets.ecmwf.int](https://secrets.ecmwf.int/). Open your profile menu and select **Copy token**.
